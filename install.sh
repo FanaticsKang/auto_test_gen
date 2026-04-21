@@ -276,7 +276,7 @@ main() {
         for part in "${parts[@]}"; do
             local sname="$(echo "$part" | xargs)"
             [[ -z "$sname" ]] && continue
-            [[ -v SKILL_PATHS["$sname"] ]] || die "Unknown skill: $sname"
+            [[ -n "${SKILL_PATHS[$sname]+_}" ]] || die "Unknown skill: $sname"
             selected_names+=("$sname")
         done
     else
@@ -334,7 +334,7 @@ main() {
     if [[ $skip_deps -eq 0 && $installed -gt 0 ]]; then
         local all_missing=()
         for sname in "${selected_names[@]}"; do
-            [[ -v SKILL_PATHS["$sname"] ]] || continue
+            [[ -n "${SKILL_PATHS[$sname]+_}" ]] || continue
             target_skill_dir="${target_skills_dir}/${sname}"
             [[ -d "$target_skill_dir" ]] || continue
 

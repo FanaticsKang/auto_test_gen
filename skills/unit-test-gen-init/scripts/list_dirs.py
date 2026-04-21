@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 list_dirs.py — 从 scan_result.json 中提取被扫描文件的顶层目录。
 
