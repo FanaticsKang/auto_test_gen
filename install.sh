@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="${SCRIPT_DIR}/skills"
+AGENTS_DIR="${SCRIPT_DIR}/agents"
 SKILL_MANIFEST="SKILL.md"
 
 die() { echo "Error: $*" >&2; exit 1; }
@@ -79,6 +80,23 @@ done
 
 [[ $installed -eq 0 ]] && die "No skills found in ${SKILLS_DIR}"
 
+# 2. 安装所有 agents
+agents_installed=0
+if [[ -d "${AGENTS_DIR}" ]]; then
+    target_agents_dir="${target_path}/.claude/agents"
+    mkdir -p "$target_agents_dir"
+
+    for agent_file in "${AGENTS_DIR}"/*.md; do
+        [[ -f "$agent_file" ]] || continue
+        agent_name="$(basename "$agent_file")"
+        cp "$agent_file" "${target_agents_dir}/${agent_name}"
+        echo "  [OK] agent: ${agent_name}"
+        ((agents_installed++)) || true
+    done
+else
+    echo "  No agents directory found, skipping."
+fi
+
 # 2. 生成 settings.local.json
 settings_file="${target_path}/.claude/settings.local.json"
 mkdir -p "$(dirname "$settings_file")"
@@ -122,5 +140,5 @@ if [[ ${#all_missing[@]} -gt 0 ]]; then
 fi
 
 echo ""
-echo "Done. ${installed} skill(s) installed."
+echo "Done. ${installed} skill(s), ${agents_installed} agent(s) installed."
 echo "Restart Claude Code in the target project to activate."

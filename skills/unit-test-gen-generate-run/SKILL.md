@@ -100,11 +100,13 @@ python scripts/dispatch.py init \
 python scripts/dispatch.py claim \
   --process test/generated_unit/generate_process.json \
   --baseline test/generated_unit/test_cases.json \
-  --number 3 \
+  --number <n> \
   --stale-seconds 1800
 ```
 
-**这一步同时完成选中N个（默认为3个）并且将其标注为"running"**，无需再用 Edit 改 JSON。返回的 JSON：
+**`--number` 按语言不同取值：C++ 文件为 n = 1，Python 文件为 n = 3。**
+
+这一步同时完成选中 N 个文件并将其标注为 `"running"`，无需再用 Edit 改 JSON。返回的 JSON：
 
 - `files[]`：与 batch 同构，每个文件带 `paths.{run_result,state_shard,bug_shard,slug}`
   —— 这些 shard 路径**必须**原样传给子 agent，否则并行时会互相覆盖
@@ -114,7 +116,7 @@ python scripts/dispatch.py claim \
 
 如果 `batch_size == 0` 且 `all_done == true`，跳到步骤 7。
 
-### 步骤 4：派发子 agent（并行）
+### 步骤 4：派发子 agent
 
 对 claim 返回的每个文件，用 Agent tool 派发一个 Claude sub-agent。子 agent prompt 含：
 
@@ -150,18 +152,18 @@ python scripts/dispatch.py claim \
 并行 shards 由主 agent 统一合并：
 
 ```bash
-# 5.1 合并所有 per-file state shards
+# 7.1 合并所有 per-file state shards
 python scripts/analyze.py merge-state \
   --shards-dir .test/state_shards \
   --baseline test/generated_unit/test_cases.json \
   --output test/generated_unit/test_run_state.json
 
-# 5.2 合并所有 per-file bug shards
+# 7.2 合并所有 per-file bug shards
 python scripts/analyze.py merge-bugs \
   --shards-dir .test/bug_shards \
   --output .test/source_bugs.json
 
-# 5.3 生成按文件的分析报告（从 .test/run_results 目录聚合覆盖率）
+# 7.3 生成按文件的分析报告（从 .test/run_results 目录聚合覆盖率）
 python scripts/dispatch.py report \
   --baseline test/generated_unit/test_cases.json \
   --run-state test/generated_unit/test_run_state.json \
