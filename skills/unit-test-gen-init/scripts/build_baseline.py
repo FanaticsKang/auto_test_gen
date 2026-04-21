@@ -62,21 +62,45 @@ def _build_fresh_baseline(scan_result: dict) -> dict:
     return baseline_files
 
 
-def _compute_scan_coverage(scan_stats: dict, baseline_files: dict) -> dict:
-    """计算扫描完整性覆盖率。"""
-    total_source = scan_stats.get("total_source_files", 0)
-    scanned = scan_stats.get("scanned_files", 0)
-    total_funcs = scan_stats.get("total_functions_found", 0)
-    extracted_funcs = scan_stats.get("functions_extracted", 0)
+def _is_in_exclude_dir(path: str, exclude_dirs: list[str]) -> bool:
+    """判断路径是否在排除目录下。"""
+    return any(
+        path.startswith(d.rstrip("/") + "/") or path == d
+        for d in exclude_dirs
+    )
 
-    file_rate = round(scanned / total_source * 100, 1) if total_source else 0.0
-    func_rate = round(extracted_funcs / total_funcs * 100, 1) if total_funcs else 0.0
+
+def _compute_scan_coverage(scan_result: dict, baseline_files: dict,
+                           exclude_dirs: list[str]) -> dict:
+    """计算基线范围内的扫描完整性覆盖率。"""
+    skipped_in_scope = [
+        s for s in scan_result.get("skipped_files", [])
+        if not _is_in_exclude_dir(s["path"], exclude_dirs)
+    ]
+    skipped_funcs_in_scope = [
+        s for s in scan_result.get("skipped_functions", [])
+        if not _is_in_exclude_dir(s.get("path", ""), exclude_dirs)
+    ]
+
+    total_files_in_scope = len(baseline_files) + len(skipped_in_scope)
+    scanned_files_in_scope = len(baseline_files)
+    extracted_funcs = sum(
+        len(f["functions"]) for f in baseline_files.values()
+    )
+    total_funcs_in_scope = extracted_funcs + len(skipped_funcs_in_scope)
+
+    file_rate = round(
+        scanned_files_in_scope / total_files_in_scope * 100, 1
+    ) if total_files_in_scope else 0.0
+    func_rate = round(
+        extracted_funcs / total_funcs_in_scope * 100, 1
+    ) if total_funcs_in_scope else 0.0
 
     return {
-        "total_source_files": total_source,
-        "scanned_files": scanned,
+        "total_source_files": total_files_in_scope,
+        "scanned_files": scanned_files_in_scope,
         "file_scan_rate": file_rate,
-        "total_functions_found": total_funcs,
+        "total_functions_found": total_funcs_in_scope,
         "extracted_functions": extracted_funcs,
         "function_scan_rate": func_rate,
     }
@@ -134,9 +158,8 @@ def merge_into_baseline(existing: dict, fresh_files: dict,
         for f in fi["functions"].values()
     )
 
-    # 扫描覆盖率
-    scan_stats = scan_result.get("scan_stats", {})
-    coverage = _compute_scan_coverage(scan_stats, merged_files)
+    # 扫描覆盖率（基线范围）
+    coverage = _compute_scan_coverage(scan_result, merged_files, exclude_dirs)
 
     # coverage_config：用户编辑优先，更新 exclude_dirs
     coverage_config = existing.get("coverage_config", dict(DEFAULT_COVERAGE_CONFIG))
