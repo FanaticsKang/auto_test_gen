@@ -14,9 +14,10 @@ description: 单测生成流水线的生成-执行阶段：读取 init 阶段产
 
 支持 Python（pytest + coverage.py）和 C++（gtest + gcov/lcov）。语言从基线 `languages` 字段自动判定。
 
-## 硬规则：基线只读
+## 硬规则
 
-**`test_cases.json` 是 init 阶段的产物，本 skill 永远不修改它。**
+1. **基线只读**：`test_cases.json` 是 init 阶段的产物，本 skill 永远不修改它。
+2. **源码不可写**：本 skill（含所有子 agent）只能在 `test/` 和 `.test/` 目录下创建/修改文件，**不得修改除 `test/` 以外的任何源码文件**。
 
 ## 职责分工
 
@@ -26,7 +27,7 @@ description: 单测生成流水线的生成-执行阶段：读取 init 阶段产
 
 ## 前置条件
 
-- `test/generated_unit/test_cases.json` 已由 init 阶段产生
+- `test/generated_unit/test_cases.json` 已由 init 阶段产生, 如果没有生成则直接终止
 - Python 路径：`pip install pytest pytest-cov coverage`
 - C++ 路径：`cmake` + `gcov` + `lcov`，源码以 `--coverage` 编译
 
@@ -44,9 +45,8 @@ description: 单测生成流水线的生成-执行阶段：读取 init 阶段产
 | `.test/bug_shards/<slug>.json` | 子 agent（`analyze record-bug`） | **per-file** 源码 bug shard |
 | `.test/source_bugs.json` | 主 agent（`analyze merge-bugs` 产出） | 合并后的源码疑似 bug |
 
-并行正确性的关键约束：**`.test/run_results`、`.test/state_shards`、`.test/bug_shards`
-是每个 sub-agent 自己的 shard 目录，互不冲突。** 全局单文件（`test_run_state.json`、
-`.test/source_bugs.json`）只在步骤 7 之后由主 agent 调用 merge 命令一次性生成。
+并行正确性的关键约束：**`.test/run_results`、`.test/state_shards`、`.test/bug_shards`是每个 sub-agent 自己的 shard 目录，互不冲突。**
+全局单文件（`test_run_state.json`、`.test/source_bugs.json`）只在步骤 7 之后由主 agent 调用 merge 命令一次性生成。
 
 ## 脚本结构
 
@@ -81,6 +81,8 @@ cat test/generated_unit/test_cases.json | python3 -c "import json,sys; d=json.lo
 
 ### 步骤 2：初始化调度状态
 
+如果 `generate_process.json` 已存在，可以直接进入步骤 3。
+
 ```bash
 python scripts/dispatch.py init \
   --baseline test/generated_unit/test_cases.json \
@@ -91,9 +93,6 @@ python scripts/dispatch.py init \
 
 生成 `generate_process.json`，每个源文件一条记录，初始 status 为 `"pending"`。
 `shards_root` 会被记住，后续 `batch / claim` 输出的 `paths.*` 都基于它。
-
-如果 `generate_process.json` 已存在，可以直接进入步骤 3；status 集中的每个终态
-（`"completed" / "unmet" / "abandoned"`）都算收尾。
 
 ### 步骤 3：原子 claim 一批文件
 

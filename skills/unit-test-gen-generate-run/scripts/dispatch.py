@@ -5,7 +5,7 @@ dispatch.py — 单测生成流水线的调度编排脚本。
 子命令：
   init    从 test_cases.json 生成 generate_process.json
   batch   只读筛选：返回 n 个待处理文件的信息，不改状态
-  claim   原子选 N 个文件并标 "执行中"（含 claimed_at），返回与 batch 同构的信息
+  claim   原子选 N 个文件并标 "running"（含 claimed_at），返回与 batch 同构的信息
   report  按源文件输出测试分析报告（Markdown / JSON）
 
 claim 对比 batch：batch 只查不写、适合 dry-run；claim 原子写回状态、适合并行派发。
@@ -110,7 +110,7 @@ def cmd_init(args):
         files[src_path] = {
             "file_md5": finfo.get("file_md5", ""),
             "test_path": finfo.get("test_path", ""),
-            "status": "未创建",
+            "status": "pending",
             "result": None,
         }
 
@@ -139,7 +139,7 @@ def cmd_init(args):
 # ---------------------------------------------------------------------------
 
 def _terminal_statuses():
-    return {"已完成", "未达标", "已放弃"}
+    return {"completed", "unmet", "abandoned"}
 
 
 def _priority_score(src_path: str, bl_file: dict) -> float:
@@ -178,12 +178,12 @@ def _select_candidates(proc_files, stale_seconds, bl_files=None):
     """候选 = 未创建 + stale 任务，按优先级排序。"""
     raw = [
         path for path, info in proc_files.items()
-        if info.get("status") == "未创建"
+        if info.get("status") == "pending"
     ]
     if stale_seconds and stale_seconds > 0:
         now = datetime.now()
         for path, info in proc_files.items():
-            if info.get("status") != "执行中":
+            if info.get("status") != "running":
                 continue
             claimed_at = info.get("claimed_at")
             if not claimed_at:
@@ -261,7 +261,7 @@ def cmd_batch(args):
 
 
 # ---------------------------------------------------------------------------
-# claim: 原子选 N 个，改状态为 "执行中"，返回同构信息
+# claim: 原子选 N 个，改状态为 "running"，返回同构信息
 # ---------------------------------------------------------------------------
 
 def cmd_claim(args):
@@ -288,11 +288,11 @@ def cmd_claim(args):
     for p in claim_paths:
         info = proc_files.get(p, {})
         prev = info.get("status")
-        info["status"] = "执行中"
+        info["status"] = "running"
         info["claimed_at"] = now_iso
         info["claim_round"] = info.get("claim_round", 0) + 1
         proc_files[p] = info
-        if prev == "执行中":
+        if prev == "running":
             reclaimed.append(p)
 
     # 原子写回
