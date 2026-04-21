@@ -46,7 +46,7 @@ description: 单测生成流水线的生成-执行阶段：读取 init 阶段产
 
 并行正确性的关键约束：**`.test/run_results`、`.test/state_shards`、`.test/bug_shards`
 是每个 sub-agent 自己的 shard 目录，互不冲突。** 全局单文件（`test_run_state.json`、
-`.test/source_bugs.json`）只在步骤 5 之后由主 agent 调用 merge 命令一次性生成。
+`.test/source_bugs.json`）只在步骤 7 之后由主 agent 调用 merge 命令一次性生成。
 
 ## 脚本结构
 
@@ -60,7 +60,7 @@ description: 单测生成流水线的生成-执行阶段：读取 init 阶段产
 
 ## 标准工作流
 
-### 步骤 -1：确认覆盖率阈值
+### 步骤 1：确认覆盖率阈值
 
 在执行任何操作之前，读取基线的 `coverage_config` 并询问用户是否需要修改：
 
@@ -79,7 +79,7 @@ cat test/generated_unit/test_cases.json | python3 -c "import json,sys; d=json.lo
 
 如果用户要求修改，用 Edit 工具直接修改 `test_cases.json` 的 `coverage_config` 字段。
 
-### 步骤 0：初始化调度状态
+### 步骤 2：初始化调度状态
 
 ```bash
 python scripts/dispatch.py init \
@@ -89,13 +89,13 @@ python scripts/dispatch.py init \
   --max-iterations 5
 ```
 
-生成 `generate_process.json`，每个源文件一条记录，初始 status 为 `"未创建"`。
+生成 `generate_process.json`，每个源文件一条记录，初始 status 为 `"pending"`。
 `shards_root` 会被记住，后续 `batch / claim` 输出的 `paths.*` 都基于它。
 
-如果 `generate_process.json` 已存在，可以直接进入步骤 1；status 集中的每个终态
-（`"已完成" / "未达标" / "已放弃"`）都算收尾。
+如果 `generate_process.json` 已存在，可以直接进入步骤 3；status 集中的每个终态
+（`"completed" / "unmet" / "abandoned"`）都算收尾。
 
-### 步骤 1：原子 claim 一批文件
+### 步骤 3：原子 claim 一批文件
 
 ```bash
 python scripts/dispatch.py claim \
@@ -105,17 +105,17 @@ python scripts/dispatch.py claim \
   --stale-seconds 1800
 ```
 
-**这一步同时完成"挑 N 个"和"标 执行中"**，无需再用 Edit 改 JSON。返回的 JSON：
+**这一步同时完成选中N个（默认为3个）并且将其标注为"running"**，无需再用 Edit 改 JSON。返回的 JSON：
 
 - `files[]`：与 batch 同构，每个文件带 `paths.{run_result,state_shard,bug_shard,slug}`
   —— 这些 shard 路径**必须**原样传给子 agent，否则并行时会互相覆盖
 - `status_counts`：各状态计数
-- `reclaimed_stale`：把超过 `--stale-seconds` 的 "执行中" 任务（子 agent 崩溃 / 超时）重新回收到本批
+- `reclaimed_stale`：把超过 `--stale-seconds` 的 "running" 任务（子 agent 崩溃 / 超时）重新回收到本批
 - `all_done`：全部进入终态时为 true
 
-如果 `batch_size == 0` 且 `all_done == true`，跳到步骤 5。
+如果 `batch_size == 0` 且 `all_done == true`，跳到步骤 7。
 
-### 步骤 2：派发子 agent（并行）
+### 步骤 4：派发子 agent（并行）
 
 对 claim 返回的每个文件，用 Agent tool 派发一个 Claude sub-agent。子 agent prompt 含：
 
@@ -129,24 +129,24 @@ python scripts/dispatch.py claim \
 
 可以在同一个消息里并行派发多个子 agent（每个文件一个）。**并行子 agent 数量不能超过 3 个**。
 
-### 步骤 3：收集结果
+### 步骤 5：收集结果
 
 子 agent 完成后返回结构化 JSON。主 agent 对每个文件：
 
 1. 读取 `generate_process.json`
 2. 将子 agent 返回的 result 写入对应文件的 `result` 字段
 3. 根据 `result` 将 `status` 改为：
-   - `"已完成"`：`unmet_reasons == []`（达标）
-   - `"未达标"`：`unmet_reasons` 非空且 `iterations_used >= max_iterations`
-   - `"已放弃"`：所有 gap 函数都被 `source_bug` 阻塞
+   - `"completed"`：`unmet_reasons == []`（达标）
+   - `"unmet"`：`unmet_reasons` 非空且 `iterations_used >= max_iterations`
+   - `"abandoned"`：所有 gap 函数都被 `source_bug` 阻塞
 
-### 步骤 4：循环
+### 步骤 6：循环
 
-- 仍有 `"未创建"` 或 stale `"执行中"` → 回到步骤 1（下一批，claim 会自动回收 stale）
-- 仍有 `"执行中"` 但未超时 → 等待子 agent 完成
-- 全部终态 → 步骤 5
+- 仍有 `"pending"` 或 stale `"running"` → 回到步骤 3（下一批，claim 会自动回收 stale）
+- 仍有 `"running"` 但未超时 → 等待子 agent 完成
+- 全部终态 → 步骤 7
 
-### 步骤 5：合并 shards → 生成报告
+### 步骤 7：合并 shards → 生成报告
 
 并行 shards 由主 agent 统一合并：
 
@@ -175,7 +175,7 @@ python scripts/dispatch.py report \
 
 读取报告文件并呈现给用户。同时从 `generate_process.json` 汇总：
 
-- 达标文件数（`status == "已完成"`）vs 未达标（`"未达标"`）vs 已放弃（`"已放弃"`）
+- 达标文件数（`status == "completed"`）vs 未达标（`"unmet"`）vs 已放弃（`"abandoned"`）
 - 每个文件的迭代次数（`result.iterations_used`）
 - 未达标原因（`result.unmet_reasons`）和 dead code 标记（`result.dead_code`）
 
@@ -197,7 +197,7 @@ python scripts/dispatch.py report \
     "core/parser.py": {
       "file_md5": "abc123",
       "test_path": "test/generated_unit/core/test_parser.py",
-      "status": "执行中",
+      "status": "<pending|running|completed|unmet|abandoned>",
       "claimed_at": "2026-04-21T12:05:00",
       "claim_round": 1,
       "result": null
@@ -209,18 +209,18 @@ python scripts/dispatch.py report \
 `status` 状态机：
 
 ```
-未创建 ──(dispatch claim)──▶ 执行中 ──(子 agent 返回)──▶ 已完成 / 未达标 / 已放弃
+pending ──(dispatch claim)──▶ running ──(子 agent 返回)──▶ completed / unmet / abandoned
                                  │
                                  └──(超过 --stale-seconds)──▶（下次 claim 时自动回收）
 ```
 
 | status | 含义 |
 |---|---|
-| `未创建` | 还没派发过 |
-| `执行中` | `dispatch claim` 已写入 `claimed_at` |
-| `已完成` | 子 agent 返回 `unmet_reasons == []`，达到阈值 |
-| `未达标` | 耗尽 `max_iterations` 仍未达标 |
-| `已放弃` | 所有 gap 函数都被 source_bug 阻塞，补不了 |
+| `pending` | 还没派发过 |
+| `running` | `dispatch claim` 已写入 `claimed_at` |
+| `completed` | 子 agent 返回 `unmet_reasons == []`，达到阈值 |
+| `unmet` | 耗尽 `max_iterations` 仍未达标 |
+| `abandoned` | 所有 gap 函数都被 source_bug 阻塞，补不了 |
 
 ## 子 agent 返回结果结构
 
@@ -250,7 +250,7 @@ python scripts/dispatch.py report \
 - **覆盖率为 0**：pytest-cov 未装 / C++ 编译没加 `--coverage`；runner.py 会标记 `tool_status`
 - **源码 md5 漂移**：runner.py 检测到漂移写入 `md5_drifts`，提醒用户重跑 init
 - **子 agent 超时 / 崩溃**：不用手工清理。下一次 `dispatch claim --stale-seconds N`
-  会把 `claimed_at` 早于 `now-N` 秒的"执行中"任务自动回收进本批，`reclaimed_stale`
+  会把 `claimed_at` 早于 `now-N` 秒的"running"任务自动回收进本批，`reclaimed_stale`
   字段会列出被回收的文件路径。
 
 ## 依赖

@@ -65,19 +65,19 @@ python scripts/list_dirs.py --scan .test/scan_result.json
 
 ### 步骤 4: 生成基线
 
-#### 3a:首次生成(基线不存在)
+#### 4a:首次生成(基线不存在)
 
 ```bash
 python scripts/build_baseline.py --scan .test/scan_result.json --output test/generated_unit/test_cases.json --mode full --exclude-dirs <exclude_dirs>
 ```
 
-#### 3b:增量生成(基线已存在)
+#### 4b:增量生成(基线已存在)
 
 ```bash
 python scripts/build_baseline.py --scan .test/scan_result.json --output test/generated_unit/test_cases.json --exclude-dirs <exclude_dirs>
 ```
 
-其中 `<exclude_dirs>` 为步骤 2 中用户选中的排除目录，以空格分隔传入（如 `--exclude-dirs tools/config`）。
+其中 `<exclude_dirs>` 为步骤 3 中用户选中的排除目录，以空格分隔传入（如 `--exclude-dirs tools/config`）。
 
 `build_baseline.py` 会自动与已有 `test_cases.json` merge,保留用户编辑的 `coverage_config`、`tool_status`、未变函数的 `cases`。`--exclude-dirs` 传入的目录会写入 `coverage_config.exclude_dirs`，并且这些目录下的文件不会出现在基线中。
 
