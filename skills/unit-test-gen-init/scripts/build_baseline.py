@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 build_baseline.py — 从 scan_repo.py 的原始扫描结果生成 test_cases.json 基线。
 

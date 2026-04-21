@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 scan_repo.py — 纯扫描器：扫描代码仓库，提取所有可测试函数（支持 Python 和 C++）。
 
