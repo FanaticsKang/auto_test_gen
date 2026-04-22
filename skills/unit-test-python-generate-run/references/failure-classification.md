@@ -28,17 +28,6 @@ Python —
 | 源码目录 | 运行时异常，但测试用例本身就是用边界/非法输入来触发（维度 = `boundary`/`exception`）且 case 期望异常 | `test_code_bug`（断言方式错，例如没用 `pytest.raises`） |
 | `unittest.mock` 内部 | 任意 | `test_code_bug`（mock 用法错） |
 
-C++ —
-
-| 特征 | 默认分类 |
-|---|---|
-| 链接错误 / undefined reference | `test_code_bug`（CMake 依赖没加） |
-| 编译错误在测试文件 | `test_code_bug` |
-| `EXPECT_*` / `ASSERT_*` 失败，失败帧在测试文件且 actual 被源码直接计算 | `source_code_bug`（源码结果不对） |
-| segfault 且栈顶在源文件 | `source_code_bug`（经典空指针/越界） |
-| segfault 且栈顶在测试 harness | `test_code_bug`（setup 问题） |
-| 未捕获异常 `std::*_error`，且测试期望正常返回 | `source_code_bug` |
-
 ## 语义兜底
 
 当优先级规则不足以定论时（比如 `AssertionError` 同时出现在测试和源码栈），LLM 应**读源码和测试代码对比**：
@@ -64,15 +53,6 @@ C++ —
 3. **路径分隔符**：Windows vs Unix；测试硬编码 `/` 是 `test_code_bug`
 4. **时区**：`datetime.now()` 相关；测试没 freeze 时间是 `test_code_bug`
 5. **类方法调用时漏了 `self`**：`test_code_bug`
-
-### C++ 反模式
-
-1. **未定义行为（UB）**：测试结果在不同编译器/优化级别下不一致。如果测试依赖 UB 行为（如越界读取碰巧返回 0），是 `test_code_bug`；如果源码本身触发 UB，是 `source_code_bug`
-2. **静态/全局状态泄漏**：一个 TEST 改了全局变量，下一个 TEST 受影响。是 `test_code_bug`（应使用 `TEST_F` 的 Setup/Teardown 清理状态）
-3. **链接错误（undefined reference）**：通常是 CMake 配置或测试文件缺少 `#include`。是 `test_code_bug`
-4. **模板实例化失败**：源码模板声明了但测试用了错误的模板参数。如果参数在契约范围内报错 → `source_code_bug`；如果参数不合理 → `test_code_bug`
-5. **栈溢出 / 递归深度**：测试输入导致无限递归。如果输入合理 → `source_code_bug`（缺终止条件）；如果输入极端 → `test_code_bug`（应限制递归深度）
-6. **gtest 断言语义混淆**：`ASSERT_*`（fatal）vs `EXPECT_*`（non-fatal）。如果测试期望后续检查仍执行但用了 `ASSERT_*` 导致跳过 → `test_code_bug`
 
 ## 调用 `analyze.py record-bug` 的提示
 

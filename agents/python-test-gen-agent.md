@@ -46,7 +46,7 @@
     "bug_shard": ".test/bug_shards/core_parser_py.json"
   },
   "repo_root": "/path/to/repo",
-  "scripts_dir": "skills/unit-test-gen-generate-run/scripts"
+  "scripts_dir": "skills/unit-test-python-generate-run/scripts"
 }
 ```
 

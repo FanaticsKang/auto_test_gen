@@ -98,7 +98,7 @@
 | `id` | string | 是 | 用例唯一 ID（同一函数内唯一）。建议 `<dimension>_<nn>`，如 `functional_01`、`boundary_03`、`exception_02` |
 | `dimension` | string | 是 | 所属维度：`functional` / `boundary` / `exception` / `data_integrity` / `performance` / `security` |
 | `description` | string | 是 | 一句话说明测什么（便于人阅读和 LLM 下轮决策） |
-| `test_name` | string | 是 | 生成的测试函数名（Python）或 `Suite.Test` 名（C++），供失败定位使用 |
+| `test_name` | string | 是 | 生成的测试函数名（如 `test_parse_header_valid`），供失败定位使用 |
 | `inputs` | object | 可选 | 结构化输入描述 |
 | `expected` | any | 可选 | 期望输出描述 |
 | `status` | string | 是 | 状态枚举，见下 |
@@ -117,7 +117,7 @@
 | `fixed_pending_rerun` | LLM 判为测试代码 bug，已修测试代码等待重跑 |
 | `source_bug` | LLM 判为源代码 bug，已落盘 `.test/source_bugs.json`，不再重跑 |
 | `failed_persistent` | 修复 3 次仍失败，已按 source_bug 登记 |
-| `skipped` | pytest/gtest 明确 skip（pytest.mark.skip / GTEST_SKIP） |
+| `skipped` | pytest 明确 skip（`pytest.mark.skip`） |
 
 ### CASE_ID 约定
 
@@ -138,13 +138,6 @@ def test_parse_header_valid():
 @pytest.mark.parametrize("value", [0, 1, -1])
 def test_parse_header_boundary(value):
     ...
-```
-
-C++：
-
-```cpp
-// CASE_ID: functional_01
-TEST(ParseHeaderTest, ValidInput) { ... }
 ```
 
 ### case 完整示例
