@@ -255,12 +255,9 @@ def _find_test_snippet(test_file: Path, test_name: str):
     lines = _read_lines(test_file)
     last_dot = test_name.split(".")[-1]
     py_pat = re.compile(rf"\s*def\s+{re.escape(test_name)}\s*\(")
-    cpp_pat = re.compile(
-        rf"\s*TEST(?:_F|_P)?\s*\([^,]+,\s*{re.escape(last_dot)}\s*\)"
-    )
 
     for i, ln in enumerate(lines, start=1):
-        if py_pat.match(ln) or cpp_pat.match(ln):
+        if py_pat.match(ln):
             indent = len(ln) - len(ln.lstrip())
             end = i
             for j in range(i + 1, len(lines) + 1):
@@ -269,7 +266,7 @@ def _find_test_snippet(test_file: Path, test_name: str):
                     continue
                 nxt_indent = len(nxt) - len(nxt.lstrip())
                 if (nxt_indent <= indent and nxt.strip()
-                        and not nxt.strip().startswith(("#", "//", "@"))):
+                        and not nxt.strip().startswith(("#", "@"))):
                     break
                 end = j
             return _slice(lines, i, end, pad=0)

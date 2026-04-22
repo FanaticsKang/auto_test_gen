@@ -15,7 +15,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `language` | string | `"python"` 或 `"cpp"` |
+| `language` | string | `"python"` |
 | `generated_at` | string | ISO 8601 时间戳 |
 | `return_code` | int | 测试执行的 exit code |
 | `tool_status` | object | 各工具的可用性，见下 |
@@ -23,23 +23,15 @@
 | `summary` | object | 测试通过/失败数 + 覆盖率摘要 |
 | `tests` | array | 每个测试的执行结果 |
 | `coverage` | object | 按文件的详细覆盖率 |
-| `error` | string | 仅在早期故障（构建失败等）时出现 |
+| `error` | string | 仅在早期故障时出现 |
 
 ## `tool_status`
-
-Python：
 
 ```json
 {"pytest": true, "pytest_cov": true, "coverage_json": true}
 ```
 
-C++：
-
-```json
-{"build": true, "ctest": true, "gcov": true, "lcov": true}
-```
-
-任一为 false 时，下游需要给出警告或降级（比如 lcov 缺失→跳过覆盖率统计）。
+任一为 false 时，下游需要给出警告或降级（比如 pytest-cov 缺失→跳过覆盖率统计）。
 
 ## `md5_drifts`
 
@@ -95,7 +87,7 @@ C++：
 | 字段 | 说明 |
 |---|---|
 | `status` | `passed` / `failed` / `error` / `skipped` |
-| `failure_type` | 异常类型。Python: `AssertionError` / `ImportError` / `TypeError` 等；C++: `SIGSEGV` / `SIGABRT` / `std::runtime_error` / `std::logic_error` 等。仅在失败时填 |
+| `failure_type` | 异常类型（`AssertionError` / `ImportError` / `TypeError` 等），仅在失败时填 |
 | `traceback` | 失败/错误时的完整 traceback 文本 |
 | `case_id` | 由 CASE_ID 注释反查（见 `run-state-schema.md` 里的 "CASE_ID 约定"）；匹配不到则为 null |
 
@@ -130,11 +122,10 @@ C++：
 
 ## 典型异常
 
-- 构建失败（C++）：顶层出现 `"error": "build 失败 (rc=...)"` + `build_stderr`
 - pytest 不可用：顶层 `"error": "pytest 未安装..."`
-- 覆盖率工具缺失：`summary.coverage` 各字段为 0，`tool_status.coverage_json` / `tool_status.lcov` = false
+- 覆盖率工具缺失：`summary.coverage` 各字段为 0，`tool_status.coverage_json` = false
 
-## 覆盖率配置与 C++ 构建集成
+## 覆盖率配置
 
 ### `coverage_config` 字段
 
@@ -192,39 +183,6 @@ pytest --junit-xml=... --cov=<source_dirs> --cov-branch \
   sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
   ```
 - **源目录含可执行脚本**：setup 脚本被 pytest 采到会触发 import 报错。把这种目录放进 `coverage_config.exclude_dirs`
-
-### C++ 覆盖率细节
-
-`runner.py run` 接受：
-
-- `--build-cmd`：构建命令（必须用 `--coverage` 编译过）
-- `--test-cmd`：测试命令（通常 `ctest`）
-- `--gcov-root`：放 `.gcda` 的目录（通常 `build/`）
-
-CMake 建议：
-
-```cmake
-if(CMAKE_BUILD_TYPE STREQUAL "Coverage")
-    add_compile_options(--coverage -O0 -g)
-    add_link_options(--coverage)
-endif()
-```
-
-然后：
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Coverage
-cmake --build build --target all_tests
-```
-
-`runner.py run` 跑测试后用：
-
-```
-lcov --capture --directory <gcov-root> --output-file coverage.info \
-     --rc lcov_branch_coverage=1
-```
-
-收集数据。LLM 可以在步骤 3 失败后改写 `--build-cmd` 重试。
 
 ### 排除目录的语义
 
