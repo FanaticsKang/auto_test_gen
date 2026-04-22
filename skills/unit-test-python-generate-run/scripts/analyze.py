@@ -194,6 +194,45 @@ def _apply_patch(run_state, baseline, patch, round_n):
     return {"updated_funcs": updated_funcs, "new_cases": new_cases, "total_cases": total_cases}
 
 
+def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
+    """从 run_result 的 tests[] 读取测试结果，更新 run_state 中对应 case 的 status。
+
+    返回更新的 case 数量。
+    """
+    # 建立 test_name → test_result 映射
+    test_map = {}
+    for t in run_result.get("tests", []):
+        test_map[t.get("name", "")] = t
+
+    synced = 0
+    for src_path, rs_file in run_state.get("files", {}).items():
+        for func_key, rs_func in rs_file.get("functions", {}).items():
+            for case in rs_func.get("cases", []):
+                test_name = case.get("test_name", "")
+                t = test_map.get(test_name)
+                if not t:
+                    continue
+
+                new_status = None
+                ts = t.get("status", "")
+                if ts == "passed":
+                    new_status = "passed"
+                elif ts == "failed":
+                    new_status = "failed"
+                elif ts == "error":
+                    new_status = "failed"
+                elif ts == "skipped":
+                    new_status = "skipped"
+
+                if new_status and case.get("status") != new_status:
+                    case["status"] = new_status
+                    synced += 1
+                    # 失败时补充 traceback
+                    if new_status == "failed" and t.get("traceback"):
+                        case.setdefault("failure_reason", t.get("failure_type"))
+    return synced
+
+
 def cmd_update_state(args):
     baseline_path = Path(args.baseline)
     run_state_path = Path(args.run_state)
@@ -216,16 +255,27 @@ def cmd_update_state(args):
     patch = json.loads(patch_path.read_text(encoding="utf-8"))
 
     stats = _apply_patch(run_state, baseline, patch, args.round)
+
+    # 可选：从 run_result 自动同步 case 状态
+    synced = 0
+    if args.run_result:
+        rr_path = Path(args.run_result)
+        if rr_path.is_file():
+            run_result = json.loads(rr_path.read_text(encoding="utf-8"))
+            synced = _sync_case_status_from_result(run_state, run_result)
+
     _write_json_atomic(run_state, run_state_path)
 
-    print(
+    msg = (
         f"运行状态已更新: {run_state_path}\n"
         f"  轮数: {args.round}\n"
         f"  更新函数: {stats['updated_funcs']}\n"
         f"  新增 case: {stats['new_cases']}\n"
-        f"  当前 total_cases: {stats['total_cases']}",
-        file=sys.stderr,
+        f"  当前 total_cases: {stats['total_cases']}"
     )
+    if synced:
+        msg += f"\n  从 run_result 同步状态: {synced} 个 case"
+    print(msg, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +793,8 @@ def main():
     p_us.add_argument("--baseline", required=True, help="test_cases.json（只读）")
     p_us.add_argument("--run-state", required=True, help="test_run_state.json")
     p_us.add_argument("--cases-patch", required=True, help="LLM 生成的 cases patch")
+    p_us.add_argument("--run-result", default=None,
+                      help="可选；runner.py 产出的 run_result.json，用于自动同步 case 状态")
     p_us.add_argument("--round", type=int, required=True, help="轮数")
 
     # extract-failures

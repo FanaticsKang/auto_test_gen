@@ -28,10 +28,10 @@
 ## `tool_status`
 
 ```json
-{"pytest": true, "pytest_cov": true, "coverage_json": true}
+{"pytest": true, "pytest_cov": true, "coverage_json": true, "xdist": true}
 ```
 
-任一为 false 时，下游需要给出警告或降级（比如 pytest-cov 缺失→跳过覆盖率统计）。
+`xdist` 为 false 时自动降级为串行执行，不影响功能。
 
 ## `md5_drifts`
 
@@ -136,7 +136,9 @@
   "statement_threshold": 90,
   "branch_threshold": 90,
   "function_threshold": 100,
-  "exclude_dirs": ["tools", "experimental"]
+  "exclude_dirs": ["tools", "experimental"],
+  "no_progress_rounds": 2,
+  "per_function_max_iterations": 3
 }
 ```
 
@@ -146,8 +148,10 @@
 | `branch_threshold` | 90 | 全局分支覆盖率阈值 |
 | `function_threshold` | 100 | 函数覆盖率阈值（建议保持 100，所有函数都至少被一个测试覆盖） |
 | `exclude_dirs` | `[]` | 不参与统计和补测的顶层目录 |
+| `no_progress_rounds` | 2 | 连续 N 轮覆盖率增量 < 0.5pp 且新增 case 通过率 == 0 时强制终止迭代 |
+| `per_function_max_iterations` | 3 | 单个函数最多补测 N 轮，missed_lines 持续不变则标记 hard_to_test |
 
-三项**全部**达标才算通过。任一未达标 → 走下一轮补测（最多 5 轮）。
+三项**全部**达标才算通过。任一未达标 → 走下一轮补测（最多 `max_iterations` 轮）。
 
 ### 迭代终止条件
 

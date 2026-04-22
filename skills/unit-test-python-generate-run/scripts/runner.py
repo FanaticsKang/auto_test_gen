@@ -176,7 +176,7 @@ def _run_python(args, baseline):
     else:
         pytest_target = Path(args.tests).resolve()
         tests_scan_dir = pytest_target
-    tool_status = {"pytest": False, "pytest_cov": False, "coverage_json": False}
+    tool_status = {"pytest": False, "pytest_cov": False, "coverage_json": False, "xdist": False}
 
     py = sys.executable or "python"
     rc, _, _ = _run([py, "-c", "import pytest"])
@@ -185,6 +185,10 @@ def _run_python(args, baseline):
     tool_status["pytest_cov"] = rc == 0
     rc, _, _ = _run([py, "-c", "import coverage"])
     tool_status["coverage_json"] = rc == 0
+    rc, _, _ = _run([py, "-c", "import xdist"])
+    tool_status["xdist"] = rc == 0
+    if not tool_status["xdist"]:
+        print("pytest-xdist 未安装，降级为串行执行。主 agent 应在派发前安装。", file=sys.stderr)
 
     if not tool_status["pytest"]:
         return {
@@ -205,6 +209,8 @@ def _run_python(args, baseline):
             f"--junit-xml={junit_xml}",
             "-q", "--no-header", "--tb=short",
         ]
+        if tool_status["xdist"] and not args.no_parallel:
+            cmd.extend(["-n", "logical"])
         env = dict(os.environ)
         if tool_status["pytest_cov"] and tool_status["coverage_json"]:
             source_dirs = (args.source_dirs or ".").split(",")
@@ -423,6 +429,8 @@ def main():
                        help="仅在报告里保留这些源文件（逗号分隔的相对路径），"
                             "并按它们重新计算 summary。适合 sub-agent 的 per-file 模式。")
     p_run.add_argument("--baseline", default=None, help="基线路径")
+    p_run.add_argument("--no-parallel", action="store_true", default=False,
+                       help="禁用 pytest-xdist 并行执行（用于 debug）")
     p_run.add_argument("--output", required=True)
 
     args = parser.parse_args()
