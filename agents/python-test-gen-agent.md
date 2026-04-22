@@ -36,7 +36,9 @@
   "coverage_config": {
     "statement_threshold": 90,
     "branch_threshold": 90,
-    "function_threshold": 100
+    "function_threshold": 100,
+    "no_progress_rounds": 2,
+    "per_function_max_iterations": 3
   },
   "max_iterations": 5,
   "paths": {
@@ -245,8 +247,11 @@ python {scripts_dir}/analyze.py update-state \
   --baseline test/generated_unit/test_cases.json \
   --run-state {paths.state_shard} \
   --cases-patch /tmp/cases_patch_iter{N}.json \
+  --run-result {paths.run_result} \
   --round {N}
 ```
+
+`--run-result` 是可选参数。传入后 `update-state` 会自动从测试结果中同步 case 状态（passed/failed/skipped），无需手工在 cases-patch 中填写执行结果。**首次注册（跑测试前）可以不传 `--run-result`；跑完测试后再调一次时传入即可同步。**
 
 cases patch 格式：
 
@@ -293,11 +298,12 @@ python {scripts_dir}/runner.py run \
 - `--test-file`：只跑自己这个文件的测试，不会被其他 sub-agent 的测试污染。
 - `--scope-sources`：覆盖率报告只保留 `source_path`，`summary` 也按它重算。
 - `--output`：写到 `paths.run_result`（per-file shard），主 agent 事后由 `dispatch report --run-results-dir` 聚合。
+- **并行执行**：主 agent 在派发前已安装 `pytest-xdist`，`runner.py` 自动检测并追加 `-n logical` 利用多核加速。如检测不到 xdist 则降级为串行。如需 debug 单线程模式，加 `--no-parallel`。
 
 底层执行命令：
 ```
 pytest --junit-xml=... --cov=<source_dirs> --cov-branch \
-       --cov-report=json:<path> --cov-report=
+       --cov-report=json:<path> --cov-report= -n logical
 ```
 
 执行后读取 `{paths.run_result}` 获取测试结果和覆盖率数据。
@@ -385,29 +391,34 @@ python {scripts_dir}/analyze.py gaps \
 
 **未达标且迭代 >= max_iterations** → 强制跳出循环，记录未达标原因。
 
-#### 收益递减早停
+#### 收益递减早停（配置驱动）
 
-在步骤 7 检查覆盖率时，与上一轮覆盖率对比：
+在步骤 7 检查覆盖率时，与上一轮覆盖率对比。阈值从 `coverage_config` 读取：
 
 ```
-if 迭代 N >= 3:
+no_progress_limit = coverage_config.get("no_progress_rounds", 2)
+
+if 迭代 N >= no_progress_limit:
     delta_stmt = 本轮 statement_rate - 上轮 statement_rate
     delta_branch = 本轮 branch_rate - 上轮 branch_rate
-    if delta_stmt < 0.5 AND delta_branch < 0.5:
-        → 收益递减，提前终止迭代
-        → 写入 unmet_reasons: "连续两轮覆盖率增量 < 0.5pp，收益递减早停"
+    本轮新增 case 通过率 = 新增 passed / 新增 total（无新增 case 时视为 0）
+    if delta_stmt < 0.5 AND delta_branch < 0.5 AND 新增 case 通过率 == 0:
+        → 无进展，提前终止迭代
+        → 写入 unmet_reasons: "连续 {no_progress_limit} 轮无进展，提前终止"
 ```
 
 你需要在每次迭代结束后记录当前覆盖率，用于下一轮比较。
 
-#### 难测函数升级
+#### 难测函数升级（配置驱动）
 
-检查每个缺口函数的 missed_lines 历史：
+检查每个缺口函数的 missed_lines 历史。阈值从 `coverage_config` 读取：
 
 ```
-if 某函数连续 2 轮 missed_lines 无变化（集合完全相同）:
+max_func_iters = coverage_config.get("per_function_max_iterations", 3)
+
+if 某函数连续 max_func_iters 轮 missed_lines 无变化（集合完全相同）:
     → 标记该函数为 hard_to_test
-    → 写入 unmet_reasons: "函数 {func_key} 连续 2 轮 gap 未闭合，标记为 hard_to_test"
+    → 写入 unmet_reasons: "函数 {func_key} 连续 {max_func_iters} 轮 gap 未闭合，标记为 hard_to_test"
     → 后续迭代跳过该函数，不再为它生成补充测试
 ```
 
@@ -452,6 +463,7 @@ if 某函数连续 2 轮 missed_lines 无变化（集合完全相同）:
 3. **Dimension 覆盖**：每个函数的每个 dimension 至少有 1 个 passed case
 4. **Mock 合理性**：mock 的 target（`patch('module.func')`）在源码中确实存在
 5. **无冗余 import**：测试文件没有导入但未使用的模块
+6. **临时文件路径**：所有需要临时文件的测试必须使用 `tmp_path` fixture（pytest 内置），不要硬编码 `/tmp` 路径——xdist 并行时每个 worker 有独立临时目录
 
 如果检查发现问题，修复后重新执行步骤 5，不要带问题返回。
 
@@ -486,6 +498,7 @@ if 某函数连续 2 轮 missed_lines 无变化（集合完全相同）:
   "unmet_reasons": [
     "parse_header branch 覆盖率 88% < 目标 90%，无法覆盖 line 45 的错误分支（疑似 dead code）"
   ],
+  "objective_blocker": true,
   "dead_code": true,
   "dead_code_locations": ["core/parser.py:45 — error handler branch unreachable"],
   "iterations_used": 3
@@ -500,6 +513,7 @@ if 某函数连续 2 轮 missed_lines 无变化（集合完全相同）:
 | `test_path` | string | 测试文件路径 |
 | `functions` | object | 每个函数的维度和覆盖率（target vs actual） |
 | `unmet_reasons` | string[] | 未达标原因列表，空数组表示全部达标 |
+| `objective_blocker` | bool | 未达标是否由客观原因导致（dead code / 抽象方法 / 不可达分支）——为 true 时主 agent 标记为"已完成（有客观缺口）"，为 false 时标记为"未达标" |
 | `dead_code` | bool | 是否存在疑似 dead code |
 | `dead_code_locations` | string[] | 疑似 dead code 的具体位置 |
 | `iterations_used` | int | 实际使用了多少次迭代 |

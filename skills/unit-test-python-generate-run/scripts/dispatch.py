@@ -420,9 +420,71 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     output = []
     output.append("# 测试分析报告（按文件）\n")
     output.append(f"- 语言: {run_result.get('language', '-')}")
-    output.append(f"- 生成时间: {run_result.get('generated_at', '-')}\n")
+    output.append(f"- 生成时间: {run_result.get('generated_at', '-')}")
+
+    # ---- 顶层汇总：按完成状态分组 ----
+    completed = []
+    unmet = []
+    abandoned = []
+    not_started = []
+    total_bugs = len(source_bugs.get("bugs", []))
 
     for src_path in sorted(baseline.get("files", {}).keys()):
+        proc_info = proc_files.get(src_path, {})
+        status = proc_info.get("status", "")
+        if status == "completed":
+            completed.append(src_path)
+        elif status == "unmet":
+            unmet.append(src_path)
+        elif status == "abandoned":
+            abandoned.append(src_path)
+        else:
+            not_started.append(src_path)
+
+    output.append(f"\n## 总览\n")
+    output.append(f"- 文件总数: {len(baseline.get('files', {}))}")
+    output.append(f"- **已达标**: {len(completed)} 个文件")
+    output.append(f"- **未达标**: {len(unmet)} 个文件")
+    output.append(f"- **已放弃**: {len(abandoned)} 个文件")
+    if not_started:
+        output.append(f"- **未开始**: {len(not_started)} 个文件")
+
+    if completed:
+        output.append(f"\n### 已达标文件\n")
+        for p in completed:
+            iters = proc_files[p].get("result", {}).get("iterations_used", "-")
+            output.append(f"- `{p}` — {iters} 轮迭代")
+
+    if unmet:
+        output.append(f"\n### 未达标文件\n")
+        for p in unmet:
+            reasons = proc_files[p].get("result", {}).get("unmet_reasons", [])
+            output.append(f"- `{p}` — {'; '.join(reasons[:3])}")
+
+    if abandoned:
+        output.append(f"\n### 已放弃文件\n")
+        for p in abandoned:
+            output.append(f"- `{p}`")
+
+    if total_bugs:
+        output.append(f"\n### 源代码疑似 bug: {total_bugs} 个\n")
+        for b in source_bugs.get("bugs", []):
+            output.append(f"- **{b.get('function', '-')}** "
+                          f"({b.get('file', '-')}, "
+                          f"case `{b.get('case_id', '-')}`): {b.get('reason', '')}")
+
+    output.append("\n---\n")
+
+    # 文件详细部分：优先展示已完成的文件
+    bl_keys = list(baseline.get("files", {}).keys())
+    def _file_sort_key(p):
+        proc_info = proc_files.get(p, {})
+        status = proc_info.get("status", "")
+        order = {"completed": 0, "unmet": 1, "abandoned": 2}
+        return order.get(status, 3)
+    bl_keys.sort(key=lambda p: (_file_sort_key(p), p))
+
+    for src_path in bl_keys:
         bl_file = baseline["files"][src_path]
         rs_file = rs_files.get(src_path, {})
         file_cov = run_cov.get(src_path, {})
@@ -668,8 +730,8 @@ def main():
     p_claim.add_argument("--process", required=True)
     p_claim.add_argument("--baseline", required=True)
     p_claim.add_argument("--number", type=int, required=True)
-    p_claim.add_argument("--stale-seconds", type=int, default=1800,
-                         help="\"执行中\"超过该秒数自动回收（默认 1800=30 分钟）")
+    p_claim.add_argument("--stale-seconds", type=int, default=600,
+                         help="\"running\"超过该秒数自动回收（默认 600=10 分钟）")
 
     # report
     p_report = sub.add_parser("report", help="按文件输出测试分析报告")
