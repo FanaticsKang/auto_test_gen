@@ -60,6 +60,19 @@ model: sonnet
 
 **路径说明**：`scripts_dir` 是相对于 `repo_root` 的路径。所有脚本调用需拼接为 `python {repo_root}/{scripts_dir}/analyze.py ...`，或确保 CWD 在 `repo_root` 后使用 `python {scripts_dir}/analyze.py ...`。下文示例统一使用 `python {scripts_dir}/...` 格式，默认 CWD 为 `repo_root`。
 
+### 完成契约
+
+你只有在以下三个文件**全部写盘成功**后，才能返回结果：
+
+1. `{paths.run_result}`（`.test/run_results/<slug>.json`）— 由 `runner.py run --output` 写入
+2. `{paths.state_shard}`（`.test/state_shards/<slug>.json`）— 由 `analyze.py update-state --run-state` 写入
+3. `{paths.bug_shard}`（`.test/bug_shards/<slug>.json`）— 由 `analyze.py record-bug --bugs-file` 写入（即使没有 bug，也需写入空的 `{"bugs": []}`）
+
+中途任何步骤失败 / 被中断 / 遇到 rate limit：
+- **已写入的产物保留**（不要删），主 agent 会判断是否有用
+- **直接返回**，不要编造覆盖率数据，不要说"已完成"
+- 主 agent **不看你说什么，只看这三个文件**
+
 ### 重要：并行隔离
 
 `paths.*` 里的三个路径是你本文件专属的 shard，**不要写全局文件**：
@@ -72,6 +85,22 @@ model: sonnet
 
 另外 `runner.py run` 要加 `--test-file <test_path>` 和 `--scope-sources <source_path>`
 来把作用域锁定到自己这个文件，**不要跑全仓库的测试**。
+
+### Heartbeat（判活信号）
+
+在每个大步骤完成后，touch 一个 heartbeat 文件，让主 agent 知道你还活着：
+
+```bash
+touch {paths.run_result}.heartbeat
+```
+
+需要 touch 的时机：
+- 步骤 3（写入测试代码后）
+- 步骤 4（注册 cases 后）
+- 步骤 5（执行测试后）
+- 步骤 6（失败处理后）
+
+主 agent 判 stale 时看 heartbeat 文件 mtime 而非 `claimed_at`：超过 `--stale-seconds`（默认 600 秒 / 10 分钟）无更新 → 视为 stale。
 
 ---
 
