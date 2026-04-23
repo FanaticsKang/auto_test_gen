@@ -52,6 +52,8 @@
 }
 ```
 
+**路径说明**：`scripts_dir` 是相对于 `repo_root` 的路径。所有脚本调用需拼接为 `python {repo_root}/{scripts_dir}/analyze.py ...`，或确保 CWD 在 `repo_root` 后使用 `python {scripts_dir}/analyze.py ...`。下文示例统一使用 `python {scripts_dir}/...` 格式，默认 CWD 为 `repo_root`。
+
 ### 重要：并行隔离
 
 `paths.*` 里的三个路径是你本文件专属的 shard，**不要写全局文件**：

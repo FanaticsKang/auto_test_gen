@@ -197,19 +197,37 @@ def _apply_patch(run_state, baseline, patch, round_n):
 def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
     """从 run_result 的 tests[] 读取测试结果，更新 run_state 中对应 case 的 status。
 
+    映射策略：
+    1. 优先用 case_id 匹配（runner.py 从 CASE_ID 注释反查的 t["case_id"]）
+    2. 回退到 (test_file, bare_name) 复合 key，bare_name 会去掉 pytest 参数化后缀 [...]
+
     返回更新的 case 数量。
     """
-    # 建立 test_name → test_result 映射
-    test_map = {}
+    import re as _re
+
+    # 建立 case_id → test_result 映射
+    by_case_id = {}
+    # 建立回退复合 key: (test_file, bare_name) → test_result
+    by_composite = {}
     for t in run_result.get("tests", []):
-        test_map[t.get("name", "")] = t
+        cid = t.get("case_id")
+        if cid:
+            by_case_id[cid] = t
+        # 去掉 pytest 参数化后缀: test_foo[bar] → test_foo
+        bare = _re.sub(r"\[.*\]$", "", t.get("name", ""))
+        tf = t.get("test_file", "")
+        by_composite[(tf, bare)] = t
 
     synced = 0
     for src_path, rs_file in run_state.get("files", {}).items():
+        test_path = rs_file.get("test_path", "")
         for func_key, rs_func in rs_file.get("functions", {}).items():
             for case in rs_func.get("cases", []):
-                test_name = case.get("test_name", "")
-                t = test_map.get(test_name)
+                # 优先按 case_id 查找
+                t = by_case_id.get(case.get("id"))
+                # 回退：按 (test_file, test_name) 复合 key
+                if not t:
+                    t = by_composite.get((test_path, case.get("test_name", "")))
                 if not t:
                     continue
 
@@ -217,9 +235,7 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
                 ts = t.get("status", "")
                 if ts == "passed":
                     new_status = "passed"
-                elif ts == "failed":
-                    new_status = "failed"
-                elif ts == "error":
+                elif ts in ("failed", "error"):
                     new_status = "failed"
                 elif ts == "skipped":
                     new_status = "skipped"
@@ -227,10 +243,37 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
                 if new_status and case.get("status") != new_status:
                     case["status"] = new_status
                     synced += 1
-                    # 失败时补充 traceback
                     if new_status == "failed" and t.get("traceback"):
                         case.setdefault("failure_reason", t.get("failure_type"))
     return synced
+
+
+def _compute_round_entry(run_state: dict, round_n: int) -> dict:
+    """从当前 run_state 计算指定 round 的元数据快照。"""
+    new_cases = 0
+    passed = 0
+    failed = 0
+    source_bugs = 0
+    for fi in run_state.get("files", {}).values():
+        for f in fi.get("functions", {}).values():
+            for c in f.get("cases", []):
+                if c.get("round_added") == round_n:
+                    new_cases += 1
+                st = c.get("status")
+                if st == "passed":
+                    passed += 1
+                elif st in ("failed", "failed_persistent"):
+                    failed += 1
+                elif st == "source_bug":
+                    source_bugs += 1
+    return {
+        "round": round_n,
+        "ended_at": datetime.now().isoformat(timespec="seconds"),
+        "new_cases": new_cases,
+        "passed": passed,
+        "failed": failed,
+        "source_bugs": source_bugs,
+    }
 
 
 def cmd_update_state(args):
@@ -263,6 +306,19 @@ def cmd_update_state(args):
         if rr_path.is_file():
             run_result = json.loads(rr_path.read_text(encoding="utf-8"))
             synced = _sync_case_status_from_result(run_state, run_result)
+
+    # 追加 per-round 元数据
+    rounds = run_state.setdefault("rounds", [])
+    existing_round_idx = next(
+        (i for i, r in enumerate(rounds) if r.get("round") == args.round), None
+    )
+    round_entry = _compute_round_entry(run_state, args.round)
+    if existing_round_idx is not None:
+        rounds[existing_round_idx] = round_entry
+    else:
+        rounds.append(round_entry)
+    # 按 round 排序
+    rounds.sort(key=lambda r: r.get("round", 0))
 
     _write_json_atomic(run_state, run_state_path)
 
