@@ -184,16 +184,53 @@ python scripts/dispatch.py claim \
 
 ### 步骤 5：派发子 agent
 
-对 claim 返回的每个文件，用 Agent tool 派发一个 Claude sub-agent，`subagent_type` 为 `python-test-gen-agent`。子 agent prompt 模板：
+对 claim 返回的 `files[]` 中每个文件，补充 `repo_root` / `scripts_dir` 后写盘，再并发派发 `python-test-gen-agent`。
 
-> 请处理以下测试生成任务，输入数据如下：
-> ```json
-> <claim 返回的该文件完整 JSON，含 paths、source_path、test_path、functions、coverage_config、max_iterations>
-> ```
-> 仓库根路径：`<repo_root>`
-> 脚本目录：`<scripts_dir>`
+#### 5a. 构建输入 JSON 并写盘
 
-可以在同一个消息里并行派发多个子 agent（每个文件一个）。**并行子 agent 数量不超过 `recommended_concurrency`**。
+`dispatch.py claim` 的 `files[]` 已包含 `source_path`、`test_path`、`file_md5`、`functions`、`coverage_config`、`max_iterations`、`paths.*`。主 agent 只需补充两个路径字段：
+
+| 补充字段 | 值 | 来源 |
+|---|---|---|
+| `repo_root` | 仓库绝对路径 | 主 agent 当前工作目录或用户指定 |
+| `scripts_dir` | `skills/unit-test-python-generate-run/scripts` 的绝对路径 | 固定 |
+
+将拼接后的完整 JSON 写入 `.test/<paths.slug>_input.json`（例如 `.test/core_parser_py_input.json`）。
+
+```json
+{
+  "source_path": "core/parser.py",
+  "test_path": "test/generated_unit/core/test_parser.py",
+  "file_md5": "<source_file_md5>",
+  "functions": { ... },
+  "coverage_config": { ... },
+  "max_iterations": 5,
+  "paths": {
+    "slug": "core_parser_py",
+    "run_result": ".test/run_results/core_parser_py.json",
+    "state_shard": ".test/state_shards/core_parser_py.json",
+    "bug_shard": ".test/bug_shards/core_parser_py.json"
+  },
+  "repo_root": "/absolute/path/to/repo",
+  "scripts_dir": "/absolute/path/to/skills/unit-test-python-generate-run/scripts"
+}
+```
+
+#### 5b. 并发派发
+
+在同一条回复里，对每个输入 JSON 用 `Agent` 工具启动 `python-test-gen-agent`，提示词模板：
+
+> 读取 `{repo_root}/.test/{slug}_input.json`，按其 JSON 内容中定义的任务执行。
+
+所有子 agent 并发启动（`run_in_background: false`），等待全部完成后进入步骤 6。
+
+#### 5c. 硬性约束
+
+- 每个文件对应一个子 agent，不可合并多个文件到一个 agent
+- `paths.*` 中的 shard 路径**必须原样传入**（来自 claim 输出），不可修改——并行时子 agent 依赖各自的 shard 隔离
+- 某个子 agent 失败不阻塞其他子 agent，继续等待剩余完成
+- 不在此步重试失败——stale 回收由步骤 4 的 `dispatch.py claim --stale-seconds` 在下一轮自动处理
+- 子 agent 返回的文本仅供参考，**步骤 6 以产物校验为准**
 
 ### 步骤 6：收集结果 + 产物校验
 
@@ -365,7 +402,6 @@ pending ──(dispatch claim)──▶ running ──(子 agent 返回 + 产物
 
 ## 参考文档
 
-- `agents/python-test-gen-agent.md`：Python 子 agent 完整工作流定义
 - `references/run-state-schema.md`：`test_run_state.json` 结构 + case 字段定义
 - `references/run-result-schema.md`：`.test/run_result.json` 结构 + 覆盖率配置
 - `references/failure-classification.md`：LLM 判定 test_code_bug / source_code_bug 的规则
