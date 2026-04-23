@@ -417,19 +417,17 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     bugs_by_file = _group_bugs_by_file(source_bugs)
     proc_files = (process or {}).get("files", {})
 
-    output = []
-    output.append("# 测试分析报告（按文件）\n")
-    output.append(f"- 语言: {run_result.get('language', '-')}")
-    output.append(f"- 生成时间: {run_result.get('generated_at', '-')}")
+    bl_files = baseline.get("files", {})
+    cov_summary = run_result.get("summary", {}).get("coverage", {})
+    cov_config = baseline.get("coverage_config", {})
 
-    # ---- 顶层汇总：按完成状态分组 ----
+    # ---- Pre-compute statistics ----
+    # File status groups
     completed = []
     unmet = []
     abandoned = []
     not_started = []
-    total_bugs = len(source_bugs.get("bugs", []))
-
-    for src_path in sorted(baseline.get("files", {}).keys()):
+    for src_path in sorted(bl_files.keys()):
         proc_info = proc_files.get(src_path, {})
         status = proc_info.get("status", "")
         if status == "completed":
@@ -441,9 +439,148 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
         else:
             not_started.append(src_path)
 
-    output.append(f"\n## 总览\n")
-    output.append(f"- 文件总数: {len(baseline.get('files', {}))}")
-    output.append(f"- **已达标**: {len(completed)} 个文件")
+    # Case counts & dimension stats
+    total_cases = 0
+    total_passed = 0
+    total_failed = 0
+    total_source_bugs = 0
+    total_pending = 0
+    total_skipped = 0
+    dim_stats = {}
+    failure_classes = {}
+
+    for src_path, rs_file in rs_files.items():
+        for func_key, rs_func in rs_file.get("functions", {}).items():
+            for c in rs_func.get("cases", []):
+                total_cases += 1
+                st = c.get("status", "")
+                dim = c.get("dimension", "unknown")
+                if dim not in dim_stats:
+                    dim_stats[dim] = {"total": 0, "passed": 0, "failed": 0, "source_bug": 0}
+                dim_stats[dim]["total"] += 1
+                if st == "passed":
+                    total_passed += 1
+                    dim_stats[dim]["passed"] += 1
+                elif st in ("failed", "failed_persistent"):
+                    total_failed += 1
+                    dim_stats[dim]["failed"] += 1
+                    fr = c.get("failure_reason") or "unclassified"
+                    failure_classes[fr] = failure_classes.get(fr, 0) + 1
+                elif st == "source_bug":
+                    total_source_bugs += 1
+                    dim_stats[dim]["source_bug"] += 1
+                    failure_classes["source_code_bug"] = failure_classes.get("source_code_bug", 0) + 1
+                elif st == "pending":
+                    total_pending += 1
+                elif st == "skipped":
+                    total_skipped += 1
+
+    # Coverage distribution
+    _ranges = ["≥95%", "90-95%", "80-90%", "60-80%", "<60%"]
+    stmt_dist = {r: 0 for r in _ranges}
+    branch_dist = {r: 0 for r in _ranges}
+    for fcov in run_cov.values():
+        sr = fcov.get("statement_rate", 0)
+        if sr >= 95: stmt_dist["≥95%"] += 1
+        elif sr >= 90: stmt_dist["90-95%"] += 1
+        elif sr >= 80: stmt_dist["80-90%"] += 1
+        elif sr >= 60: stmt_dist["60-80%"] += 1
+        else: stmt_dist["<60%"] += 1
+        br = fcov.get("branch_rate", 0)
+        if br >= 95: branch_dist["≥95%"] += 1
+        elif br >= 90: branch_dist["90-95%"] += 1
+        elif br >= 80: branch_dist["80-90%"] += 1
+        elif br >= 60: branch_dist["60-80%"] += 1
+        else: branch_dist["<60%"] += 1
+
+    # Iteration stats
+    iter_list = []
+    early_stop_count = 0
+    exhausted_count = 0
+    one_pass_count = 0
+    max_iters_config = (process or {}).get("max_iterations", 5)
+    for src_path, info in proc_files.items():
+        result = info.get("result")
+        if not result:
+            continue
+        iters = result.get("iterations_used", 0)
+        iter_list.append((src_path, iters))
+        if iters <= 1:
+            one_pass_count += 1
+        unmet_reasons = result.get("unmet_reasons", [])
+        if any("无进展" in r or "hard_to_test" in r for r in unmet_reasons):
+            early_stop_count += 1
+        if iters >= max_iters_config and unmet_reasons:
+            exhausted_count += 1
+    avg_iters = round(sum(it for _, it in iter_list) / len(iter_list), 1) if iter_list else 0
+    max_iter_entry = max(iter_list, key=lambda x: x[1]) if iter_list else (None, 0)
+
+    # Uncovered code
+    uncovered_files = []
+    for src_path, fcov in run_cov.items():
+        ml = fcov.get("missed_lines", [])
+        mb = fcov.get("missed_branches", [])
+        if ml or mb:
+            uncovered_files.append((src_path, ml, mb))
+
+    # ---- Render report ----
+    output = []
+    output.append("# 单元测试总结报告\n")
+    output.append(f"- 语言: {run_result.get('language', '-')}")
+    output.append(f"- 生成时间: {run_result.get('generated_at', '-')}")
+
+    # ---- 1. 全局统计 ----
+    bl_func_count = sum(
+        len([fk for fk, fm in bf.get("functions", {}).items()
+             if not fm.get("test_optional")])
+        for bf in bl_files.values()
+    )
+    pass_rate = round(total_passed / total_cases * 100, 1) if total_cases else 0
+    output.append(f"\n## 1. 全局统计\n")
+    output.append("| 指标 | 值 |")
+    output.append("|------|-----|")
+    tested_files = len(completed) + len(unmet) + len(abandoned)
+    output.append(f"| 源文件数 | {len(bl_files)} |")
+    output.append(f"| 已测试文件数 | {tested_files} |")
+    output.append(f"| 函数总数 | {bl_func_count} |")
+    output.append(f"| 测试用例总数 | {total_cases} |")
+    output.append(f"| 通过 | {total_passed} ({pass_rate}%) |")
+    output.append(f"| 失败 | {total_failed} |")
+    output.append(f"| 源码 bug | {total_source_bugs} |")
+    output.append(f"| 待跑 | {total_pending} |")
+    output.append(f"| 跳过 | {total_skipped} |")
+
+    # ---- 2. 覆盖率概览 ----
+    stmt_target = cov_config.get("statement_threshold", 90)
+    branch_target = cov_config.get("branch_threshold", 90)
+    func_target = cov_config.get("function_threshold", 100)
+    stmt_actual = cov_summary.get("statement_rate", 0)
+    branch_actual = cov_summary.get("branch_rate", 0)
+    func_actual = cov_summary.get("function_rate", 0)
+    output.append(f"\n## 2. 覆盖率概览\n")
+    output.append("| 指标 | 实际 | 目标 | 状态 |")
+    output.append("|------|------|------|------|")
+    output.append(f"| 语句覆盖率 | {stmt_actual}% | {stmt_target}% | "
+                  f"{'✓' if stmt_actual >= stmt_target else '✗'} |")
+    output.append(f"| 分支覆盖率 | {branch_actual}% | {branch_target}% | "
+                  f"{'✓' if branch_actual >= branch_target else '✗'} |")
+    output.append(f"| 函数覆盖率 | {func_actual}% | {func_target}% | "
+                  f"{'✓' if func_actual >= func_target else '✗'} |")
+    all_cov_met = (stmt_actual >= stmt_target and branch_actual >= branch_target
+                   and func_actual >= func_target)
+    output.append(f"\n覆盖率达标: **{'是' if all_cov_met else '否'}**")
+
+    # ---- 3. 覆盖率分布 ----
+    output.append(f"\n## 3. 覆盖率分布\n")
+    output.append("| 区间 | 语句覆盖率 | 分支覆盖率 |")
+    output.append("|------|-----------|-----------|")
+    for rng in _ranges:
+        output.append(f"| {rng} | {stmt_dist.get(rng, 0)} 个文件 | "
+                      f"{branch_dist.get(rng, 0)} 个文件 |")
+
+    # ---- 4. 文件完成状态 ----
+    output.append(f"\n## 4. 文件完成状态\n")
+    output.append(f"- **已达标**: {len(completed)}/{len(bl_files)} 个文件")
     output.append(f"- **未达标**: {len(unmet)} 个文件")
     output.append(f"- **已放弃**: {len(abandoned)} 个文件")
     if not_started:
@@ -466,14 +603,63 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
         for p in abandoned:
             output.append(f"- `{p}`")
 
+    # ---- 5. 维度覆盖 ----
+    # ---- 5. 维度覆盖 ----
+    output.append(f"\n## 5. 测试维度覆盖\n")
+    if dim_stats:
+        output.append("| 维度 | 用例数 | 通过 | 失败 | 源码 bug | 通过率 |")
+        output.append("|------|--------|------|------|---------|--------|")
+        for dim in sorted(dim_stats.keys()):
+            ds = dim_stats[dim]
+            rate = round(ds["passed"] / ds["total"] * 100, 1) if ds["total"] else 0
+            output.append(f"| {dim} | {ds['total']} | {ds['passed']} | {ds['failed']} "
+                          f"| {ds['source_bug']} | {rate}% |")
+    else:
+        output.append("*无维度数据*")
+
+    # ---- 6. 迭代效率 ----
+    output.append(f"\n## 6. 迭代效率\n")
+    if iter_list:
+        output.append(f"- 平均迭代次数: {avg_iters}")
+        if max_iter_entry[0]:
+            output.append(f"- 最多迭代: `{max_iter_entry[0]}` ({max_iter_entry[1]} 轮)")
+        output.append(f"- 一次通过: {one_pass_count} 个文件")
+        if early_stop_count:
+            output.append(f"- 提前终止（早停/难测函数）: {early_stop_count} 个文件")
+        if exhausted_count:
+            output.append(f"- 迭代耗尽: {exhausted_count} 个文件")
+    else:
+        output.append("*无迭代数据*")
+
+    # ---- 7. 失败分类汇总 ----
+    output.append(f"\n## 7. 失败分类汇总\n")
+    if failure_classes:
+        total_failures = total_failed + total_source_bugs
+        output.append(f"共 {total_failures} 个失败/bug 用例：\n")
+        output.append("| 分类 | 数量 | 占比 |")
+        output.append("|------|------|------|")
+        for cls in sorted(failure_classes.keys()):
+            cnt = failure_classes[cls]
+            pct = round(cnt / total_failures * 100, 1) if total_failures else 0
+            output.append(f"| {cls} | {cnt} | {pct}% |")
+    else:
+        output.append("*无失败用例*")
+
+    # ---- 8. 源代码疑似 bug ----
+    total_bugs = len(source_bugs.get("bugs", []))
+    output.append(f"\n## 8. 源代码疑似 bug\n")
     if total_bugs:
-        output.append(f"\n### 源代码疑似 bug: {total_bugs} 个\n")
+        output.append(f"共 {total_bugs} 个：\n")
         for b in source_bugs.get("bugs", []):
             output.append(f"- **{b.get('function', '-')}** "
                           f"({b.get('file', '-')}, "
                           f"case `{b.get('case_id', '-')}`): {b.get('reason', '')}")
+    else:
+        output.append("*无*")
 
+    # ---- 9. 文件级详细分析 ----
     output.append("\n---\n")
+    output.append("\n## 9. 文件级详细分析\n")
 
     # 文件详细部分：优先展示已完成的文件
     bl_keys = list(baseline.get("files", {}).keys())
@@ -497,10 +683,10 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
         # 调度结果
         if proc_info.get("result"):
             result = proc_info["result"]
-            unmet = result.get("unmet_reasons", [])
+            unmet_reasons = result.get("unmet_reasons", [])
             dead = result.get("dead_code", False)
-            if unmet:
-                output.append(f"- **未达标项**: {'; '.join(unmet)}")
+            if unmet_reasons:
+                output.append(f"- **未达标项**: {'; '.join(unmet_reasons)}")
             if dead:
                 output.append(f"- **存在 dead code**: 是")
             iters = result.get("iterations_used", "-")
@@ -595,6 +781,36 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
                     f"(case `{b.get('case_id', '-')}`, "
                     f"复现 {b.get('occurrence_count', 1)} 次): {b.get('reason', '')}"
                 )
+
+    # ---- 10. 未覆盖代码汇总 ----
+    if uncovered_files:
+        output.append(f"\n## 10. 未覆盖代码汇总\n")
+        output.append("| 文件 | 未覆盖行数 | 未覆盖分支数 | 未覆盖行 | 未覆盖分支 |")
+        output.append("|------|-----------|------------|---------|-----------|")
+        for src_path, ml, mb in uncovered_files:
+            ml_str = str(ml[:15]) + (" ..." if len(ml) > 15 else "")
+            mb_str = str(mb[:10]) + (" ..." if len(mb) > 10 else "")
+            output.append(f"| `{src_path}` | {len(ml)} | {len(mb)} | {ml_str} | {mb_str} |")
+
+    # ---- 11. 建议 ----
+    recommendations = []
+    if unmet:
+        recommendations.append(f"{len(unmet)} 个文件未达标，建议针对未覆盖分支补充测试")
+    if total_source_bugs:
+        recommendations.append(
+            f"发现 {total_source_bugs} 个源码疑似 bug，建议人工确认并修复源码")
+    for src_path in unmet:
+        result = proc_files.get(src_path, {}).get("result", {})
+        if result.get("dead_code"):
+            locs = result.get("dead_code_locations", [])
+            recommendations.append(
+                f"`{src_path}` 存在 dead code（{'; '.join(locs[:3])}），建议确认是否移除")
+    for src_path in abandoned:
+        recommendations.append(f"`{src_path}` 因 source_bug 已放弃，建议修复源码后重新测试")
+    if recommendations:
+        output.append(f"\n## 11. 建议\n")
+        for i, rec in enumerate(recommendations, 1):
+            output.append(f"{i}. {rec}")
 
     return "\n".join(output) + "\n"
 
