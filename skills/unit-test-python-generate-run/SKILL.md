@@ -161,12 +161,14 @@ python scripts/dispatch.py claim \
 
 ### 步骤 5：派发子 agent
 
-对 claim 返回的每个文件，用 Agent tool 派发一个 Claude sub-agent。子 agent prompt 含：
+对 claim 返回的每个文件，用 Agent tool 派发一个 Claude sub-agent，`subagent_type` 为 `python-test-gen-agent`。子 agent prompt 模板：
 
-1. `agents/python-test-gen-agent.md` 的完整内容
-2. claim 返回的该文件完整信息（含 `paths`、`source_path`、`test_path`、
-   `functions`、`coverage_config`、`max_iterations`）
-3. `repo_root` 和 `scripts_dir`（供子 agent 调用脚本）
+> 请处理以下测试生成任务，输入数据如下：
+> ```json
+> <claim 返回的该文件完整 JSON，含 paths、source_path、test_path、functions、coverage_config、max_iterations>
+> ```
+> 仓库根路径：`<repo_root>`
+> 脚本目录：`<scripts_dir>`
 
 可以在同一个消息里并行派发多个子 agent（每个文件一个）。**并行子 agent 数量不能超过 3 个**。
 

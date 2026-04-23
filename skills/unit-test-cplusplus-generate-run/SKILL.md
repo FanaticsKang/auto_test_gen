@@ -185,7 +185,7 @@ done
 
 对本批收集到的每个 input JSON 路径,在**同一条回复里**并列用 `Agent` 工具启动 sub-agent,`subagent_type` 为 `cpp-test-gen-agent`,提示词模板:
 
-> 读取 `<input JSON 绝对路径>`,按其 JSON 内容中定义的任务执行。所有指令见 `.claude/agents/cpp-test-gen-agent.md`。
+> 读取 `<input JSON 绝对路径>`,按其 JSON 内容中定义的任务执行。
 
 等待本批所有 sub-agent 全部完成后再进行下一步。
 

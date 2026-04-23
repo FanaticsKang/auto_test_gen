@@ -1,3 +1,9 @@
+---
+name: python-test-gen-agent
+description: Python 单测生成子 agent，负责为 Python 源文件生成单元测试、执行、采集覆盖率
+model: sonnet
+---
+
 # Python 单测生成 Sub-agent 工作流
 
 ## 概述
