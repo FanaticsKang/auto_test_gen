@@ -111,6 +111,12 @@ def cmd_init(args):
             "file_md5": finfo.get("file_md5", ""),
             "test_path": finfo.get("test_path", ""),
             "status": "pending",
+            "claim_round": 0,
+            "attempt_count": 0,
+            "effective_attempt_count": 0,
+            "last_error_category": None,
+            "last_attempt_at": None,
+            "abandon_reason": None,
             "result": None,
         }
 
@@ -174,8 +180,11 @@ def _priority_score(src_path: str, bl_file: dict) -> float:
     return n_funcs * dim_factor + risk_bonus + mock_bonus
 
 
-def _select_candidates(proc_files, stale_seconds, bl_files=None):
-    """候选 = 未创建 + stale 任务，按优先级排序。"""
+def _select_candidates(proc_files, stale_seconds, bl_files=None, shards_root=None):
+    """候选 = 未创建 + stale 任务，按优先级排序。
+
+    stale 判定优先看 heartbeat 文件 mtime，无 heartbeat 时回退到 claimed_at。
+    """
     raw = [
         path for path, info in proc_files.items()
         if info.get("status") == "pending"
@@ -185,14 +194,33 @@ def _select_candidates(proc_files, stale_seconds, bl_files=None):
         for path, info in proc_files.items():
             if info.get("status") != "running":
                 continue
-            claimed_at = info.get("claimed_at")
-            if not claimed_at:
-                continue
-            try:
-                ts = datetime.fromisoformat(claimed_at)
-            except ValueError:
-                continue
-            if (now - ts).total_seconds() > stale_seconds:
+            is_stale = False
+
+            # 优先看 heartbeat mtime
+            if shards_root:
+                slug = _slug(path)
+                hb = Path(f"{shards_root.rstrip('/')}/run_results/{slug}.json.heartbeat")
+                if hb.is_file():
+                    try:
+                        hb_mtime = datetime.fromtimestamp(hb.stat().st_mtime)
+                        if (now - hb_mtime).total_seconds() > stale_seconds:
+                            is_stale = True
+                    except OSError:
+                        pass
+
+            # 回退到 claimed_at
+            if not is_stale:
+                claimed_at = info.get("claimed_at")
+                if not claimed_at:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(claimed_at)
+                except ValueError:
+                    continue
+                if (now - ts).total_seconds() > stale_seconds:
+                    is_stale = True
+
+            if is_stale:
                 raw.append(path)
 
     # 按优先级排序（高 → 低）
@@ -236,7 +264,7 @@ def cmd_batch(args):
     proc_files = process.get("files", {})
     bl_files = baseline.get("files", {})
 
-    candidates = _select_candidates(proc_files, args.stale_seconds, bl_files)
+    candidates = _select_candidates(proc_files, args.stale_seconds, bl_files, shards_root)
     batch_paths = candidates[:args.number]
 
     overall = _overall_state(proc_files)
@@ -264,6 +292,67 @@ def cmd_batch(args):
 # claim: 原子选 N 个，改状态为 "running"，返回同构信息
 # ---------------------------------------------------------------------------
 
+def _compute_aimd_concurrency(proc_files, max_number):
+    """AIMD 节流：根据最近完成窗口的质量决定并发度。
+
+    只看 completed/unmet（排除 abandoned），看 effective_attempt_count
+    （含 stale reclaim）判断是否有重试。
+    规则：
+    - 最近 3 个完成的 sub-agent 中 ≥2 个 effective_attempt_count > 1 → 降到 1
+    - 最近 5 个连续 completed 且 effective_attempt_count <= 1 → 恢复到 max_number
+    - 默认 min(2, max_number)
+    """
+    recent = []
+    for src_path, info in proc_files.items():
+        st = info.get("status")
+        if st in ("completed", "unmet"):
+            recent.append(info)
+
+    recent.sort(key=lambda x: x.get("last_attempt_at") or x.get("claimed_at") or "", reverse=True)
+    recent = recent[:10]
+
+    if not recent:
+        return min(2, max_number)
+
+    last3 = recent[:3]
+    retry_count = sum(1 for r in last3 if r.get("effective_attempt_count", 0) > 1)
+    if retry_count >= 2:
+        return 1
+
+    last5 = recent[:5]
+    if len(last5) >= 5 and all(r.get("effective_attempt_count", 0) <= 1 for r in last5):
+        return max_number
+
+    return min(2, max_number)
+
+
+def _check_circuit_break(proc_files):
+    """熔断检测：最近 2 个终态文件是否连续因 exhausted_attempts 而 abandoned。
+
+    按 last_attempt_at 排序，只看最近的终态，不累积历史 abandoned。
+    返回 (should_break, reason)。
+    """
+    terminal = []
+    for src_path, info in proc_files.items():
+        if info.get("status") in _terminal_statuses():
+            terminal.append((src_path, info))
+    terminal.sort(key=lambda x: x[1].get("last_attempt_at")
+                  or x[1].get("claimed_at") or "", reverse=True)
+
+    if len(terminal) < 2:
+        return False, None
+
+    # 只看最近 2 个终态
+    for _, info in terminal[:2]:
+        if info.get("status") != "abandoned":
+            return False, None
+        if info.get("abandon_reason") != "exhausted_attempts":
+            return False, None
+
+    paths = [p for p, _ in terminal[:2]]
+    return True, f"最近 2 个文件因尝试耗尽 abandoned: {paths}"
+
+
 def cmd_claim(args):
     process_path = Path(args.process)
     process = _load_json(process_path)
@@ -280,23 +369,61 @@ def cmd_claim(args):
     proc_files = process.get("files", {})
     bl_files = baseline.get("files", {})
 
-    candidates = _select_candidates(proc_files, args.stale_seconds, bl_files)
-    claim_paths = candidates[:args.number]
+    # AIMD 节流
+    max_number = args.max_number or args.number
+    recommended = _compute_aimd_concurrency(proc_files, max_number)
+
+    # 并发窗口：running 数量已达上限时不再 claim
+    running_count = sum(1 for info in proc_files.values() if info.get("status") == "running")
+    slots_available = max(0, recommended - running_count)
+    effective_number = min(args.number, slots_available)
+
+    # 熔断检测
+    circuit_break, circuit_reason = _check_circuit_break(proc_files)
+
+    candidates = _select_candidates(proc_files, args.stale_seconds, bl_files, shards_root)
+
+    # 过滤 effective_attempt_count >= 3 的文件（自动 abandoned）
+    abandoned_now = []
+    for p in list(candidates):
+        info = proc_files.get(p, {})
+        if (info.get("effective_attempt_count", 0) >= 3
+                and info.get("status") != "abandoned"):
+            info["status"] = "abandoned"
+            info["abandon_reason"] = "exhausted_attempts"
+            abandoned_now.append({
+                "path": p,
+                "reason": f"effective_attempt_count={info['effective_attempt_count']} 无产物",
+                "attempt_count": info.get("attempt_count", 0),
+                "effective_attempt_count": info.get("effective_attempt_count", 0),
+                "last_error_category": info.get("last_error_category"),
+            })
+            candidates.remove(p)
+
+    claim_paths = candidates[:effective_number]
 
     now_iso = datetime.now().isoformat(timespec="seconds")
     reclaimed = []
     for p in claim_paths:
         info = proc_files.get(p, {})
         prev = info.get("status")
+        is_reclaim = (prev == "running")
         info["status"] = "running"
         info["claimed_at"] = now_iso
         info["claim_round"] = info.get("claim_round", 0) + 1
+        # effective_attempt_count 在每次 claim（含 stale reclaim）都 +1
+        # 用于 AIMD 判断是否有重试和自动 abandoned 阈值
+        info["effective_attempt_count"] = info.get("effective_attempt_count", 0) + 1
+        # attempt_count 只在首次 claim 时 +1（排除 stale reclaim）
+        if not is_reclaim:
+            info["attempt_count"] = info.get("attempt_count", 0) + 1
+        info["last_attempt_at"] = now_iso
         proc_files[p] = info
-        if prev == "running":
+        if is_reclaim:
             reclaimed.append(p)
 
     # 原子写回
-    if claim_paths:
+    if claim_paths or abandoned_now:
         _write_json_atomic(process, process_path)
 
     overall = _overall_state(proc_files)
@@ -309,6 +436,11 @@ def cmd_claim(args):
         "batch_size": len(batch),
         "claimed_at": now_iso,
         "reclaimed_stale": reclaimed,
+        "auto_abandoned": abandoned_now,
+        "recommended_concurrency": recommended,
+        "running_count": running_count,
+        "circuit_break": circuit_break,
+        "circuit_break_reason": circuit_reason,
         "files": batch,
         **overall,
     }, indent=2, ensure_ascii=False))
@@ -569,6 +701,46 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     all_cov_met = (stmt_actual >= stmt_target and branch_actual >= branch_target
                    and func_actual >= func_target)
     output.append(f"\n覆盖率达标: **{'是' if all_cov_met else '否'}**")
+
+    # 未达标原因分析
+    if not all_cov_met:
+        output.append(f"\n### 未达标原因\n")
+        # 按指标归类：找出拉低整体覆盖率的文件
+        for metric, actual, target, cov_key in [
+            ("语句覆盖率", stmt_actual, stmt_target, "statement_rate"),
+            ("分支覆盖率", branch_actual, branch_target, "branch_rate"),
+            ("函数覆盖率", func_actual, func_target, "function_rate"),
+        ]:
+            if actual >= target:
+                continue
+            gap = round(target - actual, 1)
+            # 找低于阈值的文件
+            below = []
+            for src_path, fcov in run_cov.items():
+                rate = fcov.get(cov_key, 0)
+                if rate < target:
+                    below.append((src_path, rate))
+            below.sort(key=lambda x: x[1])
+            output.append(f"**{metric}** ({actual}% < 目标 {target}%，差 {gap}pp)：")
+            if below:
+                for p, r in below[:5]:
+                    proc_info = proc_files.get(p, {})
+                    status = proc_info.get("status", "?")
+                    result = proc_info.get("result") or {}
+                    obj_blocker = result.get("objective_blocker", False)
+                    reason_suffix = ""
+                    if status == "abandoned":
+                        reason_suffix = "（已放弃）"
+                    elif status == "unmet" and obj_blocker:
+                        reason_suffix = "（客观原因：dead code / 不可达分支）"
+                    elif status == "unmet":
+                        reason_suffix = "（迭代未达标）"
+                    output.append(f"- `{p}`: {r}%{reason_suffix}")
+                if len(below) > 5:
+                    output.append(f"- ... 还有 {len(below) - 5} 个文件低于阈值")
+            else:
+                output.append("- 无单文件数据（可能为聚合精度问题）")
+            output.append("")
 
     # ---- 3. 覆盖率分布 ----
     output.append(f"\n## 3. 覆盖率分布\n")
@@ -918,6 +1090,77 @@ def cmd_report(args):
 # main
 # ---------------------------------------------------------------------------
 
+def cmd_verify_artifacts(args):
+    """验证 sub-agent 三个产物文件是否齐全，并原子回写 generate_process.json。"""
+    process_path = Path(args.process)
+    process = _load_json(process_path)
+    if not process:
+        print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
+        sys.exit(1)
+
+    shards_root = process.get("shards_root", ".test")
+    proc_files = process.get("files", {})
+    src_path = args.file
+
+    if src_path not in proc_files:
+        print(f"错误: {src_path} 不在调度状态中", file=sys.stderr)
+        sys.exit(1)
+
+    info = proc_files[src_path]
+    slug = _slug(src_path)
+    root = shards_root.rstrip("/")
+
+    artifacts = {
+        "run_result": Path(f"{root}/run_results/{slug}.json"),
+        "state_shard": Path(f"{root}/state_shards/{slug}.json"),
+        "bug_shard": Path(f"{root}/bug_shards/{slug}.json"),
+    }
+    missing = []
+    invalid = []
+    for name, p in artifacts.items():
+        if not p.is_file():
+            missing.append(name)
+        elif p.stat().st_size == 0 and name != "bug_shard":
+            # bug_shard 允许空文件；run_result / state_shard 不允许
+            missing.append(f"{name}(empty)")
+        else:
+            try:
+                json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                invalid.append(name)
+
+    all_problems = missing + invalid
+    if all_problems:
+        # 产物缺失或无效 → 回退
+        prev_status = info.get("status", "")
+        info["status"] = args.on_missing
+        info["last_error_category"] = "no_artifact"
+        if args.on_missing == "abandoned":
+            info["abandon_reason"] = "exhausted_attempts"
+        _write_json_atomic(process, process_path)
+        print(json.dumps({
+            "verified": False,
+            "source_path": src_path,
+            "missing_artifacts": missing,
+            "invalid_artifacts": invalid,
+            "previous_status": prev_status,
+            "new_status": args.on_missing,
+            "last_error_category": "no_artifact",
+        }, ensure_ascii=False))
+    else:
+        # 产物齐全 → attempt_count 归零（成功完成）
+        info["attempt_count"] = 0
+        info["effective_attempt_count"] = 0
+        info["last_error_category"] = None
+        _write_json_atomic(process, process_path)
+        print(json.dumps({
+            "verified": True,
+            "source_path": src_path,
+            "artifacts": {name: str(p) for name, p in artifacts.items()},
+            "attempt_count_reset": True,
+        }, ensure_ascii=False))
+
+
 def main():
     parser = argparse.ArgumentParser(description="单测生成调度编排")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -946,6 +1189,8 @@ def main():
     p_claim.add_argument("--process", required=True)
     p_claim.add_argument("--baseline", required=True)
     p_claim.add_argument("--number", type=int, required=True)
+    p_claim.add_argument("--max-number", type=int, default=None,
+                         help="AIMD 允许的最大并发度（默认等于 --number）")
     p_claim.add_argument("--stale-seconds", type=int, default=600,
                          help="\"running\"超过该秒数自动回收（默认 600=10 分钟）")
 
@@ -965,6 +1210,14 @@ def main():
     p_report.add_argument("--output", required=True)
     p_report.add_argument("--format", choices=["markdown", "json"], default="markdown")
 
+    # verify-artifacts
+    p_va = sub.add_parser("verify-artifacts",
+                          help="验证 sub-agent 三个产物文件是否齐全，回写状态")
+    p_va.add_argument("--process", required=True, help="generate_process.json 路径")
+    p_va.add_argument("--file", required=True, help="源文件路径（key in process.files）")
+    p_va.add_argument("--on-missing", choices=["pending", "abandoned"], default="pending",
+                      help="产物缺失时回退到的状态（默认 pending）")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -975,6 +1228,8 @@ def main():
         cmd_claim(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "verify-artifacts":
+        cmd_verify_artifacts(args)
 
 
 if __name__ == "__main__":
