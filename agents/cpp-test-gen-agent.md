@@ -50,21 +50,21 @@ model: sonnet
 {
   "files": [
     {
-      "source_path": "core/parser.cpp",
-      "test_path": "test/generated_unit/core/test_parser.cpp",
+      "source_path": "math/vec3.cpp",
+      "test_path": "test/generated_unit/math/test_vec3.cpp",
       "file_md5": "<src_file_md5>",
       "functions": {
-        "parse_header": {
+        "calc_norm": {
           "dimensions": ["functional", "boundary", "exception"],
           "line_range": [10, 45],
-          "signature": "Header parse_header(const std::string& data)",
+          "signature": "double calc_norm(const std::vector<double>& v)",
           "class_name": null,
           "namespace": null,
           "is_template": false,
           "is_static": false,
           "is_virtual": false,
           "mocks_needed": [
-            {"type": "interface", "suggestion": "mock IHttpClient dependency"}
+            {"type": "interface", "suggestion": "mock IWriter dependency"}
           ]
         },
         "Lexer::tokenize": { "...": "..." }
