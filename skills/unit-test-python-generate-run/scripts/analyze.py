@@ -9,6 +9,11 @@ analyze.py — 单测生成流水线的分析处理脚本。
   record-bug         追加源代码疑似 bug 到报告文件 / 或 per-file shard
   merge-state        合并 per-file state shards → 统一 test_run_state.json
   merge-bugs         合并 per-file bug shards → 统一 source_bugs.json
+  apply-and-run      Chained: update-state → runner.py run → update-state sync
+  classify-failures  硬编码失败分类 → verdicts.json
+  decide-next        阈值 + fix_attempts 决定 next_action
+  scaffold-cases     按 signature/dimensions 推占位 case
+  lint-cases         校验 case 质量（必填字段/维度合法/去重）
 
 基线 (test_cases.json) 全程只读。
 
@@ -29,6 +34,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -204,6 +210,7 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
     返回更新的 case 数量。
     """
     import re as _re
+    from analyze_rules.failure_classification import compute_traceback_fingerprint
 
     # 建立 case_id → test_result 映射
     by_case_id = {}
@@ -244,7 +251,16 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
                     case["status"] = new_status
                     synced += 1
                     if new_status == "failed" and t.get("traceback"):
-                        case.setdefault("failure_reason", t.get("failure_type"))
+                        if not case.get("failure_reason"):
+                            case["failure_reason"] = t.get("failure_type")
+                        # Phase 2: 存储 traceback fingerprint 历史
+                        fp = compute_traceback_fingerprint(
+                            t["traceback"], t.get("test_file", "")
+                        )
+                        if fp:
+                            fps = case.setdefault("traceback_fingerprints", [])
+                            if fp not in fps:
+                                fps.append(fp)
     return synced
 
 
@@ -279,13 +295,14 @@ def _compute_round_entry(run_state: dict, round_n: int) -> dict:
 def cmd_update_state(args):
     baseline_path = Path(args.baseline)
     run_state_path = Path(args.run_state)
-    patch_path = Path(args.cases_patch)
+
+    # O18: --cases-patch 和 --cases-patch-dir 至少需要一个
+    if not args.cases_patch and not getattr(args, "cases_patch_dir", None):
+        print("错误: 必须提供 --cases-patch 或 --cases-patch-dir 之一", file=sys.stderr)
+        sys.exit(1)
 
     if not baseline_path.is_file():
         print(f"错误: 基线 {baseline_path} 不存在", file=sys.stderr)
-        sys.exit(1)
-    if not patch_path.is_file():
-        print(f"错误: patch {patch_path} 不存在", file=sys.stderr)
         sys.exit(1)
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
@@ -295,9 +312,39 @@ def cmd_update_state(args):
     else:
         run_state = _init_run_state(baseline, baseline_path)
 
-    patch = json.loads(patch_path.read_text(encoding="utf-8"))
+    # O18: 支持单文件 --cases-patch 或目录模式 --cases-patch-dir
+    patches = []
+    if hasattr(args, "cases_patch_dir") and args.cases_patch_dir:
+        patch_dir = Path(args.cases_patch_dir)
+        if not patch_dir.is_dir():
+            print(f"错误: patch 目录 {patch_dir} 不存在", file=sys.stderr)
+            sys.exit(1)
+        for pf in sorted(patch_dir.glob("*.json")):
+            try:
+                patches.append(json.loads(pf.read_text(encoding="utf-8")))
+            except Exception as e:
+                print(f"警告: 跳过无效 patch {pf}: {e}", file=sys.stderr)
+    else:
+        patch_path = Path(args.cases_patch)
+        if not patch_path.is_file():
+            print(f"错误: patch {patch_path} 不存在", file=sys.stderr)
+            sys.exit(1)
+        patches.append(json.loads(patch_path.read_text(encoding="utf-8")))
 
-    stats = _apply_patch(run_state, baseline, patch, args.round)
+    total_stats = {"updated_funcs": 0, "new_cases": 0, "total_cases": 0}
+    for patch in patches:
+        stats = _apply_patch(run_state, baseline, patch, args.round)
+        total_stats["updated_funcs"] += stats["updated_funcs"]
+        total_stats["new_cases"] += stats["new_cases"]
+    if patches:
+        total_stats["total_cases"] = stats["total_cases"]
+    else:
+        # 空 patches：从 run_state 重算
+        total_stats["total_cases"] = sum(
+            len(f.get("cases", []))
+            for fi in run_state.get("files", {}).values()
+            for f in fi.get("functions", {}).values()
+        )
 
     # 可选：从 run_result 自动同步 case 状态
     synced = 0
@@ -325,9 +372,9 @@ def cmd_update_state(args):
     msg = (
         f"运行状态已更新: {run_state_path}\n"
         f"  轮数: {args.round}\n"
-        f"  更新函数: {stats['updated_funcs']}\n"
-        f"  新增 case: {stats['new_cases']}\n"
-        f"  当前 total_cases: {stats['total_cases']}"
+        f"  更新函数: {total_stats['updated_funcs']}\n"
+        f"  新增 case: {total_stats['new_cases']}\n"
+        f"  当前 total_cases: {total_stats['total_cases']}"
     )
     if synced:
         msg += f"\n  从 run_result 同步状态: {synced} 个 case"
@@ -809,6 +856,9 @@ def cmd_merge_bugs(args):
             continue
 
         for b in shard.get("bugs", []):
+            # 跳过 sub-agent 写入的 NONE 占位条目
+            if b.get("function") == "NONE" and b.get("case_id") == "NONE":
+                continue
             fp = b.get("fingerprint") or \
                 f"{b.get('file')}::{b.get('function')}::{b.get('case_id')}"
             if fp in by_fp:
@@ -825,6 +875,12 @@ def cmd_merge_bugs(args):
                     )
             else:
                 by_fp[fp] = dict(b)
+                # Phase 5: 初始化 review 字段
+                by_fp[fp].setdefault("review", {
+                    "status": "pending",
+                    "reviewer": None,
+                    "result": None,
+                })
                 order.append(fp)
 
     merged["bugs"] = [by_fp[fp] for fp in order]
@@ -832,6 +888,410 @@ def cmd_merge_bugs(args):
     print(
         f"已合并 {len(shard_paths)} 个 bug shards → {args.output}；共 "
         f"{len(merged['bugs'])} 条",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# apply-and-run: update-state → runner.py run → update-state sync (单命令)
+# ---------------------------------------------------------------------------
+
+def cmd_apply_and_run(args):
+    """Chained: update-state → runner.py run → update-state sync.
+
+    Sub-agent 每轮只需调用这一个命令，替换原来的 3 个 tool call。
+    输出结构化 JSON，包含 runner 结果和 run_state 摘要。
+    """
+    baseline_path = Path(args.baseline)
+    run_state_path = Path(args.run_state)
+    patch_path = Path(args.cases_patch) if args.cases_patch else None
+
+    if not baseline_path.is_file():
+        print(f"错误: 基线 {baseline_path} 不存在", file=sys.stderr)
+        sys.exit(1)
+    if (patch_path is None or not patch_path.is_file()) \
+       and not getattr(args, "cases_patch_dir", None):
+        print("错误: 必须提供 --cases-patch 或 --cases-patch-dir", file=sys.stderr)
+        sys.exit(1)
+
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+
+    # Step 1: update-state (apply patch)
+    if run_state_path.is_file():
+        run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    else:
+        run_state = _init_run_state(baseline, baseline_path)
+
+    # 加载 patch（支持单文件或目录模式）
+    patches = []
+    if getattr(args, "cases_patch_dir", None) and args.cases_patch_dir:
+        for pf in sorted(Path(args.cases_patch_dir).glob("*.json")):
+            patches.append(json.loads(pf.read_text(encoding="utf-8")))
+    if patch_path and patch_path.is_file():
+        patches.append(json.loads(patch_path.read_text(encoding="utf-8")))
+
+    # 应用 patches 到 run_state（累加 stats，不覆盖）
+    total_stats = {"updated_funcs": 0, "new_cases": 0}
+    for patch in patches:
+        s = _apply_patch(run_state, baseline, patch, args.round)
+        total_stats["updated_funcs"] += s["updated_funcs"]
+        total_stats["new_cases"] += s["new_cases"]
+    total_stats["total_cases"] = s["total_cases"] if patches else 0
+    stats = total_stats
+
+    _write_json_atomic(run_state, run_state_path)
+
+    # Step 2: runner.py run
+    runner_path = args.runner_path
+    if not runner_path:
+        runner_path = str(Path(__file__).parent / "runner.py")
+
+    runner_cmd = [
+        sys.executable, runner_path, "run",
+        "--test-file", args.test_file,
+        "--output", args.run_result,
+        "--repo-root", args.repo_root,
+    ]
+    if args.source_dirs:
+        runner_cmd += ["--source-dirs", args.source_dirs]
+    if args.scope_sources:
+        runner_cmd += ["--scope-sources", args.scope_sources]
+    runner_cmd += ["--baseline", str(baseline_path)]
+    if args.no_coverage:
+        runner_cmd.append("--no-coverage")
+    if args.only_cases:
+        runner_cmd += ["--only-cases", args.only_cases]
+    if args.xdist_min_tests is not None:
+        runner_cmd += ["--xdist-min-tests", str(args.xdist_min_tests)]
+    if args.xdist_workers is not None:
+        runner_cmd += ["--xdist-workers", str(args.xdist_workers)]
+    if args.no_parallel:
+        runner_cmd.append("--no-parallel")
+    if getattr(args, "cov_append", False):
+        runner_cmd.append("--cov-append")
+    if getattr(args, "cov_file", None):
+        runner_cmd += ["--cov-file", args.cov_file]
+
+    proc = subprocess.run(runner_cmd, capture_output=True, text=True)
+
+    # Step 3: update-state (sync case status from run_result)
+    rr_path = Path(args.run_result)
+    synced = 0
+    if rr_path.is_file():
+        run_result_data = json.loads(rr_path.read_text(encoding="utf-8"))
+        run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+        synced = _sync_case_status_from_result(run_state, run_result_data)
+
+        # Append round entry
+        rounds = run_state.setdefault("rounds", [])
+        existing_round_idx = next(
+            (i for i, r in enumerate(rounds) if r.get("round") == args.round), None
+        )
+        round_entry = _compute_round_entry(run_state, args.round)
+        if existing_round_idx is not None:
+            rounds[existing_round_idx] = round_entry
+        else:
+            rounds.append(round_entry)
+        rounds.sort(key=lambda r: r.get("round", 0))
+        _write_json_atomic(run_state, run_state_path)
+
+    # Step 4: Build output JSON
+    run_result_final = json.loads(rr_path.read_text(encoding="utf-8")) if rr_path.is_file() else {}
+    run_state_final = json.loads(run_state_path.read_text(encoding="utf-8")) if run_state_path.is_file() else {}
+
+    rr_summary = run_result_final.get("summary", {})
+    cov_summary = rr_summary.get("coverage", {})
+
+    output = {
+        "step": "apply-and-run",
+        "round": args.round,
+        "patch_stats": stats,
+        "synced_cases": synced,
+        "runner_returncode": proc.returncode,
+        "runner_stderr": proc.stderr[-2000:] if proc.stderr else "",
+        "run_result_summary": {
+            "return_code": run_result_final.get("return_code"),
+            "total_tests": rr_summary.get("total_tests", 0),
+            "passed": rr_summary.get("passed", 0),
+            "failed": rr_summary.get("failed", 0),
+            "errors": rr_summary.get("errors", 0),
+            "pass_rate": rr_summary.get("pass_rate", 0),
+        },
+        "coverage": cov_summary,
+        "case_id_index": run_result_final.get("case_id_index", {}),
+        "run_state_summary": run_state_final.get("summary", {}),
+    }
+
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# classify-failures: 硬编码失败分类
+# ---------------------------------------------------------------------------
+
+def cmd_classify_failures(args):
+    """从 run_result 提取失败 case，用硬编码规则分类，输出 verdicts.json。"""
+    from analyze_rules.failure_classification import classify_failures_batch
+
+    run_result = _load_json(args.run_result)
+    if not run_result:
+        print(f"错误: run_result {args.run_result} 不存在或为空", file=sys.stderr)
+        sys.exit(1)
+
+    failures = [
+        t for t in run_result.get("tests", [])
+        if t.get("status") in ("failed", "error")
+    ]
+
+    # 加载 run_state（可选，用于多轮证据积累）
+    run_state = None
+    if getattr(args, "run_state", None):
+        run_state = _load_json(args.run_state)
+
+    is_last_round = getattr(args, "round", 1) >= getattr(args, "max_iterations", 5) - 1
+
+    verdicts = classify_failures_batch(
+        failures,
+        run_state=run_state,
+        is_last_round=is_last_round,
+    )
+
+    output = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source_run_result": str(args.run_result),
+        "total_failures": len(failures),
+        "verdicts": verdicts,
+    }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # 统计
+    by_verdict = {}
+    for v in verdicts:
+        key = v.get("preliminary_verdict", "unknown")
+        by_verdict[key] = by_verdict.get(key, 0) + 1
+
+    print(
+        f"分类完成: {len(verdicts)} 个失败 → {out_path}\n"
+        f"  test_code_bug={by_verdict.get('test_code_bug', 0)}, "
+        f"source_code_bug={by_verdict.get('source_code_bug', 0)}, "
+        f"ambiguous={by_verdict.get('ambiguous', 0)}",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# decide-next: 决定下一步行动
+# ---------------------------------------------------------------------------
+
+def cmd_decide_next(args):
+    """根据当前状态决定 next_action。"""
+    from analyze_rules.decide_policy import decide_next_action
+
+    run_state = _load_json(args.run_state)
+    baseline = _load_json(args.baseline)
+    run_result = _load_json(args.run_result) if args.run_result else {}
+
+    if not run_state:
+        print(f"错误: run_state {args.run_state} 不存在", file=sys.stderr)
+        sys.exit(1)
+
+    cov_config = baseline.get("coverage_config", {})
+    stmt_thr = cov_config.get("statement_threshold", 90)
+    branch_thr = cov_config.get("branch_threshold", 90)
+    func_thr = cov_config.get("function_threshold", 100)
+
+    cov_summary = run_result.get("summary", {}).get("coverage", {})
+    stmt_rate = cov_summary.get("statement_rate", 0)
+    branch_rate = cov_summary.get("branch_rate", 0)
+    func_rate = cov_summary.get("function_rate", 0)
+
+    # 统计 case 状态
+    total_cases = passed = failed = source_bugs = pending = 0
+    for fi in run_state.get("files", {}).values():
+        for f in fi.get("functions", {}).values():
+            for c in f.get("cases", []):
+                total_cases += 1
+                st = c.get("status")
+                if st == "passed":
+                    passed += 1
+                elif st in ("failed", "failed_persistent"):
+                    failed += 1
+                elif st == "source_bug":
+                    source_bugs += 1
+                elif st == "pending":
+                    pending += 1
+
+    # 加载 verdicts（可选）
+    verdicts = None
+    if args.verdicts:
+        vdata = _load_json(args.verdicts)
+        if vdata:
+            verdicts = vdata.get("verdicts", [])
+
+    result = decide_next_action(
+        statement_rate=stmt_rate,
+        branch_rate=branch_rate,
+        function_rate=func_rate,
+        statement_threshold=stmt_thr,
+        branch_threshold=branch_thr,
+        function_threshold=func_thr,
+        total_cases=total_cases,
+        passed=passed,
+        failed=failed,
+        source_bugs=source_bugs,
+        pending=pending,
+        current_round=args.round,
+        max_iterations=args.max_iterations,
+        verdicts=verdicts,
+    )
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(
+        f"决策: {result['action']} → {out_path}\n"
+        f"  原因: {result['reason']}",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# scaffold-cases: 按 signature/dimensions 推占位 case
+# ---------------------------------------------------------------------------
+
+def cmd_scaffold_cases(args):
+    """为 gap 函数生成占位 case，输出 cases-patch 格式。"""
+    from analyze_rules.scaffold_templates import scaffold_cases
+
+    gaps_data = _load_json(args.gaps)
+    if not gaps_data:
+        print(f"错误: gaps 文件 {args.gaps} 不存在或为空", file=sys.stderr)
+        sys.exit(1)
+
+    all_cases = []
+    for gap in gaps_data.get("gaps", []):
+        func_key = gap.get("function", "")
+        signature = gap.get("signature", "")
+        dimensions = gap.get("dimensions", []) + gap.get("missing_dimensions", [])
+        dimensions = list(dict.fromkeys(dimensions))  # 去重保序
+        existing_ids = [c.get("id", "") for c in gap.get("existing_cases", [])]
+
+        cases = scaffold_cases(
+            func_key=func_key,
+            signature=signature,
+            dimensions=dimensions,
+            existing_case_ids=existing_ids,
+        )
+        if cases:
+            all_cases.append({
+                "file": gap.get("file", ""),
+                "function": func_key,
+                "cases": cases,
+            })
+
+    # 转为 cases-patch 格式
+    patch = {"files": {}}
+    for entry in all_cases:
+        fpath = entry["file"]
+        if fpath not in patch["files"]:
+            patch["files"][fpath] = {"functions": {}}
+        patch["files"][fpath]["functions"][entry["function"]] = {
+            "cases": entry["cases"],
+        }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(patch, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    total = sum(len(e["cases"]) for e in all_cases)
+    print(
+        f"脚手架: {len(all_cases)} 个函数 × {total} 个占位 case → {out_path}",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# lint-cases: 校验 case 质量
+# ---------------------------------------------------------------------------
+
+def cmd_lint_cases(args):
+    """校验 cases-patch 文件中的 case 质量。"""
+    from analyze_rules.lint_rules import lint_cases_patch
+
+    patch_path = Path(args.cases_patch)
+    if not patch_path.is_file():
+        print(f"错误: cases-patch {patch_path} 不存在", file=sys.stderr)
+        sys.exit(1)
+
+    patch = json.loads(patch_path.read_text(encoding="utf-8"))
+    findings = lint_cases_patch(patch, repo_root=args.repo_root)
+
+    output = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source_patch": str(patch_path),
+        "total_findings": len(findings),
+        "errors": [f for f in findings if f.get("severity") == "error"],
+        "warnings": [f for f in findings if f.get("severity") == "warning"],
+    }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    n_err = len(output["errors"])
+    n_warn = len(output["warnings"])
+    print(
+        f"校验完成: {n_err} 个错误, {n_warn} 个警告 → {out_path}",
+        file=sys.stderr,
+    )
+    if n_err > 0:
+        sys.exit(1)
+
+
+def cmd_lint_assertions(args):
+    """扫描测试文件中的弱断言（Phase 3）。"""
+    from analyze_rules.lint_rules import lint_assertions
+
+    test_file = Path(args.test_file)
+    if not test_file.is_file():
+        print(f"错误: 测试文件 {test_file} 不存在", file=sys.stderr)
+        sys.exit(1)
+
+    test_source = test_file.read_text(encoding="utf-8", errors="replace")
+
+    # 构建 test_name → dimension 映射
+    case_dimensions = {}
+    if args.baseline:
+        baseline_path = Path(args.baseline)
+        if baseline_path.is_file():
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+            for fi in baseline.get("files", {}).values():
+                for func_key, func_data in fi.get("functions", {}).items():
+                    for c in func_data.get("cases", []):
+                        tn = c.get("test_name", "")
+                        dim = c.get("dimension", "")
+                        if tn and dim:
+                            case_dimensions[tn] = dim
+
+    findings = lint_assertions(test_source, case_dimensions=case_dimensions or None)
+
+    output = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source_file": str(test_file),
+        "total_findings": len(findings),
+        "warnings": findings,
+    }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    n_warn = len(findings)
+    print(
+        f"断言 lint 完成: {n_warn} 个弱断言警告 → {out_path}",
         file=sys.stderr,
     )
 
@@ -848,7 +1308,9 @@ def main():
     p_us = sub.add_parser("update-state", help="合并 cases patch 到 run_state")
     p_us.add_argument("--baseline", required=True, help="test_cases.json（只读）")
     p_us.add_argument("--run-state", required=True, help="test_run_state.json")
-    p_us.add_argument("--cases-patch", required=True, help="LLM 生成的 cases patch")
+    p_us.add_argument("--cases-patch", default=None, help="LLM 生成的 cases patch")
+    p_us.add_argument("--cases-patch-dir", default=None,
+                       help="O18: 包含多个 cases patch JSON 的目录（替代 --cases-patch）")
     p_us.add_argument("--run-result", default=None,
                       help="可选；runner.py 产出的 run_result.json，用于自动同步 case 状态")
     p_us.add_argument("--round", type=int, required=True, help="轮数")
@@ -899,6 +1361,70 @@ def main():
                        help="存放 bug shards 的目录（例如 .test/bug_shards）")
     p_mb.add_argument("--output", required=True, help="统一 source_bugs 输出路径")
 
+    # apply-and-run
+    p_aar = sub.add_parser("apply-and-run",
+                            help="Chained: update-state → runner run → update-state sync")
+    p_aar.add_argument("--baseline", required=True, help="test_cases.json（只读）")
+    p_aar.add_argument("--run-state", required=True, help="test_run_state.json / shard")
+    p_aar.add_argument("--cases-patch", default=None, help="LLM 生成的 cases patch")
+    p_aar.add_argument("--round", type=int, required=True, help="轮数")
+    p_aar.add_argument("--runner-path", default=None,
+                        help="runner.py 路径（默认与 analyze.py 同目录）")
+    p_aar.add_argument("--test-file", required=True, help="测试文件路径")
+    p_aar.add_argument("--run-result", required=True, help="run_result 输出路径")
+    p_aar.add_argument("--repo-root", default=".", help="仓库根目录")
+    p_aar.add_argument("--source-dirs", default=None, help="覆盖率源目录（逗号分隔）")
+    p_aar.add_argument("--scope-sources", default=None,
+                        help="仅在报告中保留的源文件（逗号分隔）")
+    p_aar.add_argument("--no-coverage", action="store_true", default=False,
+                        help="跳过覆盖率采集")
+    p_aar.add_argument("--only-cases", default=None,
+                        help="只跑指定 case（逗号分隔）")
+    p_aar.add_argument("--xdist-min-tests", type=int, default=None)
+    p_aar.add_argument("--xdist-workers", default=None)
+    p_aar.add_argument("--no-parallel", action="store_true", default=False)
+    p_aar.add_argument("--cases-patch-dir", default=None,
+                        help="包含多个 cases patch JSON 的目录（替代 --cases-patch）")
+    p_aar.add_argument("--cov-append", action="store_true", default=False,
+                        help="增量覆盖率模式（转发到 runner.py）")
+    p_aar.add_argument("--cov-file", default=None,
+                        help="指定 .coverage 文件路径（转发到 runner.py）")
+
+    # classify-failures
+    p_cf = sub.add_parser("classify-failures", help="硬编码失败分类 → verdicts.json")
+    p_cf.add_argument("--run-result", required=True, help="run_result.json")
+    p_cf.add_argument("--run-state", default=None, help="可选；run_state.json（用于 fix_attempts/sibling/fingerprint）")
+    p_cf.add_argument("--round", type=int, default=1, help="当前轮数")
+    p_cf.add_argument("--max-iterations", type=int, required=True, help="最大迭代数（用于判断末轮）")
+    p_cf.add_argument("--output", required=True, help="verdicts.json 输出路径")
+
+    # decide-next
+    p_dn = sub.add_parser("decide-next", help="决定下一步行动")
+    p_dn.add_argument("--baseline", required=True, help="test_cases.json（只读）")
+    p_dn.add_argument("--run-state", required=True, help="test_run_state.json")
+    p_dn.add_argument("--run-result", default=None, help="可选；run_result.json")
+    p_dn.add_argument("--verdicts", default=None, help="可选；classify-failures 输出")
+    p_dn.add_argument("--round", type=int, required=True, help="当前轮数")
+    p_dn.add_argument("--max-iterations", type=int, default=5, help="最大迭代数")
+    p_dn.add_argument("--output", required=True, help="next_action.json 输出路径")
+
+    # scaffold-cases
+    p_sc = sub.add_parser("scaffold-cases", help="按 gap 生成占位 case")
+    p_sc.add_argument("--gaps", required=True, help="gaps.json 输入（来自 gaps 子命令）")
+    p_sc.add_argument("--output", required=True, help="cases-patch 格式输出")
+
+    # lint-cases
+    p_lc = sub.add_parser("lint-cases", help="校验 case 质量")
+    p_lc.add_argument("--cases-patch", required=True, help="待校验的 cases patch")
+    p_lc.add_argument("--repo-root", default=None, help="仓库根目录（用于校验 mock 路径）")
+    p_lc.add_argument("--output", required=True, help="lint 结果输出路径")
+
+    # lint-assertions（Phase 3）
+    p_la = sub.add_parser("lint-assertions", help="扫描测试文件中的弱断言")
+    p_la.add_argument("--test-file", required=True, help="测试文件路径")
+    p_la.add_argument("--baseline", default=None, help="可选；test_cases.json（用于获取 dimension 映射）")
+    p_la.add_argument("--output", required=True, help="lint 结果输出路径")
+
     args = parser.parse_args()
 
     if args.command == "update-state":
@@ -913,6 +1439,18 @@ def main():
         cmd_merge_state(args)
     elif args.command == "merge-bugs":
         cmd_merge_bugs(args)
+    elif args.command == "apply-and-run":
+        cmd_apply_and_run(args)
+    elif args.command == "classify-failures":
+        cmd_classify_failures(args)
+    elif args.command == "decide-next":
+        cmd_decide_next(args)
+    elif args.command == "scaffold-cases":
+        cmd_scaffold_cases(args)
+    elif args.command == "lint-cases":
+        cmd_lint_cases(args)
+    elif args.command == "lint-assertions":
+        cmd_lint_assertions(args)
 
 
 if __name__ == "__main__":

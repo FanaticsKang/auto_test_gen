@@ -3,10 +3,12 @@
 dispatch.py — 单测生成流水线的调度编排脚本。
 
 子命令：
-  init    从 test_cases.json 生成 generate_process.json
-  batch   只读筛选：返回 n 个待处理文件的信息，不改状态
-  claim   原子选 N 个文件并标 "running"（含 claimed_at），返回与 batch 同构的信息
-  report  按源文件输出测试分析报告（Markdown / JSON）
+  init              从 test_cases.json 生成 generate_process.json
+  batch             只读筛选：返回 n 个待处理文件的信息，不改状态
+  claim             原子选 N 个文件并标 "running"（含 claimed_at），返回与 batch 同构的信息
+  prepare-shard     为指定源文件生成 task_envelope.json
+  verify-artifacts  验证 sub-agent 三个产物文件是否齐全
+  report            按源文件输出测试分析报告（Markdown / JSON）
 
 claim 对比 batch：batch 只查不写、适合 dry-run；claim 原子写回状态、适合并行派发。
 
@@ -20,9 +22,16 @@ claim 对比 batch：batch 只查不写、适合 dry-run；claim 原子写回状
 import argparse
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# 盲测模式：docstring 行为描述关键词（带词边界防止误匹配标识符）
+_ORACLE_HIGH_KEYWORDS = re.compile(
+    r"(\breturns?\b|\braises?\s|\byield\b|参数|返回|抛出|边界|\brange\b|\bthreshold\b|\bwhen\s)",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +50,66 @@ def _load_json(path) -> dict:
     if not p.is_file():
         return {}
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# 盲测模式：docstring 提取 + oracle_quality 评估
+# ---------------------------------------------------------------------------
+
+def _extract_docstring(src_lines: list, signature_line: int) -> str:
+    """从签名行之后提取 docstring（三引号块）。
+
+    signature_line 是 1-indexed（行号），src_lines 是 0-indexed 数组。
+    用 signature_line 作为 0-indexed 下标恰巧等于下一行。
+    扫描范围：从签名下一行到首个非空非注释非 pass/... 语句为止。
+    """
+    if signature_line >= len(src_lines):
+        return ""
+    start = signature_line  # 0-indexed，指向签名行的下一行
+    # 扫到第一个非装饰器、非空行、非注释的行（可能跨多行参数列表）
+    end = min(len(src_lines), start + 20)  # 最多扫 20 行，覆盖多行参数列表
+    for i in range(start, end):
+        stripped = src_lines[i].strip()
+        if stripped.startswith('"""') or stripped.startswith("'''"):
+            quote = stripped[:3]
+            # 单行 docstring
+            if stripped.count(quote) >= 2 and len(stripped) > 3:
+                # 找第二个引号位置
+                second = stripped.index(quote, 3)
+                return stripped[3:second].strip()
+            # 多行 docstring
+            parts = [src_lines[i].lstrip()[3:]]
+            for j in range(i + 1, len(src_lines)):
+                line = src_lines[j]
+                # 在行首或行尾找结束引号
+                idx = line.find(quote)
+                if idx >= 0:
+                    parts.append(line[:idx])
+                    break
+                parts.append(line)
+            return "\n".join(parts).strip()
+        elif stripped and not stripped.startswith("#") and not stripped.startswith("@"):
+            # 非空非注释非装饰器 → 函数体开始，没有 docstring
+            break
+    return ""
+
+
+def _assess_oracle_quality(docstring: str) -> str:
+    """评估 docstring 作为 oracle 的质量。
+
+    Returns:
+        "high" - 含行为描述（Returns/Raises/具体边界）
+        "medium" - 有 docstring 但无行为描述
+        "low" - 无 docstring
+    """
+    if not docstring:
+        return "low"
+    if _ORACLE_HIGH_KEYWORDS.search(docstring):
+        return "high"
+    # docstring 存在但无行为描述
+    if len(docstring.strip()) > 10:
+        return "medium"
+    return "low"
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +134,7 @@ def _shard_paths(shards_root: str, src_path: str) -> dict:
         "run_result": f"{root}/run_results/{slug}.json",
         "state_shard": f"{root}/state_shards/{slug}.json",
         "bug_shard": f"{root}/bug_shards/{slug}.json",
+        "heartbeat": f"{root}/heartbeats/{slug}.txt",
     }
 
 
@@ -195,12 +265,14 @@ def _select_candidates(proc_files, stale_seconds, bl_files=None, shards_root=Non
             if info.get("status") != "running":
                 continue
             is_stale = False
+            heartbeat_found = False
 
             # 优先看 heartbeat mtime
             if shards_root:
                 slug = _slug(path)
-                hb = Path(f"{shards_root.rstrip('/')}/run_results/{slug}.json.heartbeat")
+                hb = Path(f"{shards_root.rstrip('/')}/heartbeats/{slug}.txt")
                 if hb.is_file():
+                    heartbeat_found = True
                     try:
                         hb_mtime = datetime.fromtimestamp(hb.stat().st_mtime)
                         if (now - hb_mtime).total_seconds() > stale_seconds:
@@ -208,8 +280,8 @@ def _select_candidates(proc_files, stale_seconds, bl_files=None, shards_root=Non
                     except OSError:
                         pass
 
-            # 回退到 claimed_at
-            if not is_stale:
+            # 仅在无 heartbeat 时回退到 claimed_at
+            if not is_stale and not heartbeat_found:
                 claimed_at = info.get("claimed_at")
                 if not claimed_at:
                     continue
@@ -313,6 +385,10 @@ def _compute_aimd_concurrency(proc_files, max_number):
 
     if not recent:
         return min(2, max_number)
+
+    # 429 / rate-limit 立即 MD
+    if any(r.get("last_error_category") == "rate_limit" for r in recent[:5]):
+        return 1
 
     last3 = recent[:3]
     retry_count = sum(1 for r in last3 if r.get("effective_attempt_count", 0) > 1)
@@ -678,7 +754,7 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     output.append(f"| 测试用例总数 | {total_cases} |")
     output.append(f"| 通过 | {total_passed} ({pass_rate}%) |")
     output.append(f"| 失败 | {total_failed} |")
-    output.append(f"| 源码 bug | {total_source_bugs} |")
+    output.append(f"| 源码 bug | {len(source_bugs.get('bugs', []))} |")
     output.append(f"| 待跑 | {total_pending} |")
     output.append(f"| 跳过 | {total_skipped} |")
 
@@ -690,7 +766,7 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     branch_actual = cov_summary.get("branch_rate", 0)
     func_actual = cov_summary.get("function_rate", 0)
     output.append(f"\n## 2. 覆盖率概览\n")
-    output.append("| 指标 | 实际 | 目标 | 状态 |")
+    output.append("| 指标 | 实际（已测试文件） | 目标 | 状态 |")
     output.append("|------|------|------|------|")
     output.append(f"| 语句覆盖率 | {stmt_actual}% | {stmt_target}% | "
                   f"{'✓' if stmt_actual >= stmt_target else '✗'} |")
@@ -698,6 +774,9 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
                   f"{'✓' if branch_actual >= branch_target else '✗'} |")
     output.append(f"| 函数覆盖率 | {func_actual}% | {func_target}% | "
                   f"{'✓' if func_actual >= func_target else '✗'} |")
+    if len(not_started) > 0:
+        output.append(f"\n> 注：覆盖率仅基于 {tested_files} 个已测试文件计算，"
+                      f"{len(not_started)} 个文件尚未测试。")
     all_cov_met = (stmt_actual >= stmt_target and branch_actual >= branch_target
                    and func_actual >= func_target)
     output.append(f"\n覆盖率达标: **{'是' if all_cov_met else '否'}**")
@@ -779,13 +858,15 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     # ---- 5. 维度覆盖 ----
     output.append(f"\n## 5. 测试维度覆盖\n")
     if dim_stats:
-        output.append("| 维度 | 用例数 | 通过 | 失败 | 源码 bug | 通过率 |")
-        output.append("|------|--------|------|------|---------|--------|")
+        output.append("| 维度 | 用例数 | 通过 | 失败 | 源码 bug | 待跑 | 通过率 |")
+        output.append("|------|--------|------|------|---------|------|--------|")
         for dim in sorted(dim_stats.keys()):
             ds = dim_stats[dim]
-            rate = round(ds["passed"] / ds["total"] * 100, 1) if ds["total"] else 0
+            executed = ds["passed"] + ds["failed"] + ds["source_bug"]
+            rate = round(ds["passed"] / executed * 100, 1) if executed else 0
+            pending_dim = ds["total"] - ds["passed"] - ds["failed"] - ds["source_bug"]
             output.append(f"| {dim} | {ds['total']} | {ds['passed']} | {ds['failed']} "
-                          f"| {ds['source_bug']} | {rate}% |")
+                          f"| {ds['source_bug']} | {pending_dim} | {rate}% |")
     else:
         output.append("*无维度数据*")
 
@@ -818,11 +899,13 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
         output.append("*无失败用例*")
 
     # ---- 8. 源代码疑似 bug ----
-    total_bugs = len(source_bugs.get("bugs", []))
+    real_bugs = [b for b in source_bugs.get("bugs", [])
+                 if b.get("function") != "NONE" or b.get("case_id") != "NONE"]
+    total_bugs = len(real_bugs)
     output.append(f"\n## 8. 源代码疑似 bug\n")
     if total_bugs:
         output.append(f"共 {total_bugs} 个：\n")
-        for b in source_bugs.get("bugs", []):
+        for b in real_bugs:
             output.append(f"- **{b.get('function', '-')}** "
                           f"({b.get('file', '-')}, "
                           f"case `{b.get('case_id', '-')}`): {b.get('reason', '')}")
@@ -848,6 +931,16 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
         file_cov = run_cov.get(src_path, {})
         file_bugs = bugs_by_file.get(src_path, [])
         proc_info = proc_files.get(src_path, {})
+        file_status = proc_info.get("status", "")
+
+        # 未开始/未测试的文件：只显示一行概要，不展开函数
+        if file_status not in ("completed", "unmet", "abandoned"):
+            n_funcs = len([fk for fk, fm in bl_file.get("functions", {}).items()
+                           if not fm.get("test_optional")])
+            output.append(f"\n## `{src_path}`\n")
+            output.append(f"- 测试文件: `{bl_file.get('test_path', '-')}`")
+            output.append(f"- 状态: 未测试 | 函数数: {n_funcs}")
+            continue
 
         output.append(f"\n## `{src_path}`\n")
         output.append(f"- 测试文件: `{bl_file.get('test_path', '-')}`")
@@ -945,6 +1038,8 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
                         tb = _truncate_tb(tinfo["traceback"])
                         output.append(f"  ```\n{tb}\n  ```")
 
+        file_bugs = [b for b in file_bugs
+                     if b.get("function") != "NONE" or b.get("case_id") != "NONE"]
         if file_bugs:
             output.append(f"\n### 源代码疑似 bug ({len(file_bugs)})\n")
             for b in file_bugs:
@@ -968,9 +1063,11 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     recommendations = []
     if unmet:
         recommendations.append(f"{len(unmet)} 个文件未达标，建议针对未覆盖分支补充测试")
-    if total_source_bugs:
+    source_bug_count = len([b for b in source_bugs.get("bugs", [])
+                            if b.get("function") != "NONE" or b.get("case_id") != "NONE"])
+    if source_bug_count:
         recommendations.append(
-            f"发现 {total_source_bugs} 个源码疑似 bug，建议人工确认并修复源码")
+            f"发现 {source_bug_count} 个源码疑似 bug，建议人工确认并修复源码")
     for src_path in unmet:
         result = proc_files.get(src_path, {}).get("result", {})
         if result.get("dead_code"):
@@ -978,7 +1075,12 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
             recommendations.append(
                 f"`{src_path}` 存在 dead code（{'; '.join(locs[:3])}），建议确认是否移除")
     for src_path in abandoned:
-        recommendations.append(f"`{src_path}` 因 source_bug 已放弃，建议修复源码后重新测试")
+        proc_info = proc_files.get(src_path, {})
+        reason = proc_info.get("abandon_reason", "")
+        if reason == "all_source_bugs":
+            recommendations.append(f"`{src_path}` 因所有 gap 被 source_bug 阻塞已放弃，建议修复源码后重新测试")
+        else:
+            recommendations.append(f"`{src_path}` 因尝试耗尽已放弃（{reason}），建议检查后重新测试")
     if recommendations:
         output.append(f"\n## 11. 建议\n")
         for i, rec in enumerate(recommendations, 1):
@@ -1161,6 +1263,252 @@ def cmd_verify_artifacts(args):
         }, ensure_ascii=False))
 
 
+# ---------------------------------------------------------------------------
+# prepare-shard: 一次性产出 task_envelope
+# ---------------------------------------------------------------------------
+
+def cmd_prepare_shard(args):
+    """为指定源文件生成 task_envelope.json，包含 sub-agent 所需的全部上下文。
+
+    sub-agent 读取这一个文件就能开始工作，无需额外 Read。
+    """
+    process = _load_json(args.process)
+    baseline = _load_json(args.baseline)
+
+    if not process:
+        print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
+        sys.exit(1)
+    if not baseline:
+        print(f"错误: 基线 {args.baseline} 不存在或为空", file=sys.stderr)
+        sys.exit(1)
+
+    src_path = args.file
+    proc_files = process.get("files", {})
+    if src_path not in proc_files:
+        print(f"错误: {src_path} 不在调度状态中", file=sys.stderr)
+        sys.exit(1)
+
+    cov_config, max_iter, shards_root = _resolve_common(process, baseline)
+    info = proc_files[src_path]
+    bl_file = baseline.get("files", {}).get(src_path, {})
+    paths = _shard_paths(shards_root, src_path)
+    slug = paths["slug"]
+
+    # 收集函数信息（排除 test_optional）
+    functions = {}
+    for func_key, fmeta in bl_file.get("functions", {}).items():
+        if fmeta.get("test_optional"):
+            continue
+        functions[func_key] = {
+            "dimensions": fmeta.get("dimensions", []),
+            "line_range": fmeta.get("line_range", []),
+            "signature": fmeta.get("signature", ""),
+            "mocks_needed": fmeta.get("mocks_needed", []),
+        }
+
+    # 读取 run_state shard（获取已有 cases）
+    state_shard_path = Path(paths["state_shard"])
+    existing_cases = {}
+    if state_shard_path.is_file():
+        state_data = json.loads(state_shard_path.read_text(encoding="utf-8"))
+        for func_key, func_data in state_data.get("files", {}).get(src_path, {}).get("functions", {}).items():
+            cases = func_data.get("cases", [])
+            if cases:
+                existing_cases[func_key] = [
+                    {"id": c.get("id"), "dimension": c.get("dimension"),
+                     "status": c.get("status", "pending"),
+                     "failure_reason": c.get("failure_reason")}
+                    for c in cases
+                ]
+
+    # 读取 run_result shard（获取覆盖率）
+    run_result_path = Path(paths["run_result"])
+    coverage = {}
+    coverage_summary = {}
+    if run_result_path.is_file():
+        rr = json.loads(run_result_path.read_text(encoding="utf-8"))
+        coverage = rr.get("coverage", {}).get(src_path, {})
+        coverage_summary = rr.get("summary", {}).get("coverage", {})
+
+    # 读取 verdicts（如果存在）
+    verdicts = []
+    verdicts_path = Path(f"{shards_root.rstrip('/')}/verdicts/{slug}.json")
+    if verdicts_path.is_file():
+        vdata = json.loads(verdicts_path.read_text(encoding="utf-8"))
+        verdicts = vdata.get("verdicts", [])
+
+    # 读取 next_action（如果存在）
+    next_action_path = Path(f"{shards_root.rstrip('/')}/next_actions/{slug}.json")
+    next_action = None
+    if next_action_path.is_file():
+        next_action = json.loads(next_action_path.read_text(encoding="utf-8"))
+
+    # O14: 预切 source_snippet（每个函数 ±20 行）
+    # 盲测模式：round 1 只给签名 + docstring
+    source_snippets = {}
+    oracle_quality_map = {}
+    repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(".")
+    src_file = repo_root / src_path
+    src_lines = []
+    if src_file.is_file():
+        try:
+            src_lines = src_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            pass
+
+    use_blind = getattr(args, "blind", False) and args.round <= 1
+
+    if src_lines:
+        # 先评估所有函数的 oracle_quality（盲测模式才需要）
+        if use_blind:
+            for func_key, fmeta in bl_file.get("functions", {}).items():
+                if fmeta.get("test_optional"):
+                    continue
+                lr = fmeta.get("line_range", [0, 0])
+                docstring = _extract_docstring(src_lines, lr[0])
+                oq = _assess_oracle_quality(docstring)
+                oracle_quality_map[func_key] = oq
+
+        pad = 20
+        for func_key, fmeta in bl_file.get("functions", {}).items():
+            if fmeta.get("test_optional"):
+                continue
+            lr = fmeta.get("line_range", [0, 0])
+            oq = oracle_quality_map.get(func_key)
+
+            # 盲测模式 + oracle_quality 为 high/medium → 只给签名+docstring
+            if use_blind and oq in ("high", "medium"):
+                sig_line_idx = lr[0] - 1  # 1-indexed → 0-indexed
+                if 0 <= sig_line_idx < len(src_lines):
+                    sig_text = src_lines[sig_line_idx]
+                    docstring = _extract_docstring(src_lines, lr[0])
+                    snippet_text = sig_text
+                    if docstring:
+                        snippet_text += "\n\n" + docstring
+                    source_snippets[func_key] = {
+                        "start": lr[0],
+                        "end": lr[0],
+                        "text": snippet_text,
+                        "docstring": docstring,
+                        "mode": "blind" if oq == "high" else "narrowed",
+                    }
+            else:
+                # 正常模式 或 blind+low：±20 行完整实现
+                start = max(1, lr[0] - pad)
+                end = min(len(src_lines), lr[1] + pad)
+                source_snippets[func_key] = {
+                    "start": start,
+                    "end": end,
+                    "text": "\n".join(
+                        f"{i:>5}  {src_lines[i - 1]}"
+                        for i in range(start, end + 1)
+                    ),
+                    "mode": "sighted",
+                }
+
+    # 构建 task_envelope
+    envelope = {
+        "shard_slug": slug,
+        "source_path": src_path,
+        "test_path": info.get("test_path", bl_file.get("test_path", "")),
+        "file_md5": info.get("file_md5", ""),
+        "round": args.round,
+        "scope_sources": [src_path],
+        "functions": functions,
+        "existing_cases": existing_cases,
+        "coverage": coverage,
+        "coverage_summary": coverage_summary,
+        "coverage_config": cov_config,
+        "source_snippets": source_snippets,
+        "oracle_quality": oracle_quality_map if oracle_quality_map else None,
+        "blind_mode": use_blind,
+        "verdicts": verdicts,
+        "next_action": next_action,
+        "paths": paths,
+        "budgets": {
+            "max_iterations": max_iter,
+            "max_fix_attempts_per_case": 2,
+        },
+    }
+
+    # 写入输出
+    out_path = Path(args.output)
+    _write_json_atomic(envelope, out_path)
+
+    n_funcs = len(functions)
+    n_cases = sum(len(c) for c in existing_cases.values())
+    blind_tag = " [盲测]" if use_blind else ""
+    print(
+        f"task_envelope: {out_path}\n"
+        f"  文件: {src_path}{blind_tag}\n"
+        f"  函数: {n_funcs}, 已有 case: {n_cases}\n"
+        f"  verdicts: {len(verdicts)}, next_action: {next_action.get('action') if next_action else '-'}",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# verify-repro: 验证复现脚本（Phase 5）
+# ---------------------------------------------------------------------------
+
+def cmd_verify_repro(args):
+    """扫描 repro 目录下的 .py 脚本，逐个运行，输出验证结果。"""
+    repro_dir = Path(args.repro_dir)
+    if not repro_dir.is_dir():
+        print(f"错误: 复现脚本目录 {repro_dir} 不存在", file=sys.stderr)
+        sys.exit(1)
+
+    scripts = sorted(repro_dir.glob("*.py"))
+    if not scripts:
+        print(f"复现脚本目录为空: {repro_dir}", file=sys.stderr)
+
+    results = []
+    for script in scripts:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True, text=True, timeout=30,
+            )
+            results.append({
+                "script": script.name,
+                "return_code": proc.returncode,
+                "reproducible": proc.returncode != 0,
+                "stdout": proc.stdout[:500] if proc.stdout else "",
+                "stderr": proc.stderr[:500] if proc.stderr else "",
+            })
+        except subprocess.TimeoutExpired:
+            results.append({
+                "script": script.name,
+                "return_code": -1,
+                "reproducible": False,
+                "error": "timeout (30s)",
+            })
+        except Exception as e:
+            results.append({
+                "script": script.name,
+                "return_code": -1,
+                "reproducible": False,
+                "error": str(e),
+            })
+
+    output = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "total_scripts": len(results),
+        "reproducible": sum(1 for r in results if r.get("reproducible")),
+        "results": results,
+    }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(output, out_path)
+
+    n_repro = output["reproducible"]
+    print(
+        f"复现验证完成: {n_repro}/{len(results)} 可复现 → {out_path}",
+        file=sys.stderr,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="单测生成调度编排")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1218,6 +1566,26 @@ def main():
     p_va.add_argument("--on-missing", choices=["pending", "abandoned"], default="pending",
                       help="产物缺失时回退到的状态（默认 pending）")
 
+    # prepare-shard
+    p_ps = sub.add_parser("prepare-shard",
+                          help="为指定文件生成 task_envelope.json")
+    p_ps.add_argument("--process", required=True, help="generate_process.json 路径")
+    p_ps.add_argument("--baseline", required=True, help="test_cases.json 路径")
+    p_ps.add_argument("--file", required=True, help="源文件路径")
+    p_ps.add_argument("--round", type=int, default=1, help="当前轮数")
+    p_ps.add_argument("--repo-root", default=".", help="仓库根目录")
+    p_ps.add_argument("--output", required=True, help="task_envelope.json 输出路径")
+    p_ps.add_argument("--blind", action="store_true", default=False,
+                       help="盲测模式：round 1 的 source_snippets 只含签名+docstring")
+
+    # verify-repro（Phase 5）
+    p_vr = sub.add_parser("verify-repro",
+                          help="验证复现脚本可独立运行")
+    p_vr.add_argument("--repro-dir", required=True,
+                      help="复现脚本目录（.test/repro）")
+    p_vr.add_argument("--output", required=True,
+                      help="验证结果输出路径")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1230,6 +1598,10 @@ def main():
         cmd_report(args)
     elif args.command == "verify-artifacts":
         cmd_verify_artifacts(args)
+    elif args.command == "prepare-shard":
+        cmd_prepare_shard(args)
+    elif args.command == "verify-repro":
+        cmd_verify_repro(args)
 
 
 if __name__ == "__main__":
