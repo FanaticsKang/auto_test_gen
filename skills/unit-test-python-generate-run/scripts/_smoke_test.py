@@ -7,12 +7,14 @@ Run: python scripts/_smoke_test.py
 
 import sys
 from pathlib import Path
+import copy
 
 # 确保 analyze_rules 可 import
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyze_rules.failure_classification import classify_failure, compute_traceback_fingerprint
 from analyze_rules.decide_policy import decide_next_action
+from analyze import _sync_case_status_from_result
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +254,7 @@ def test_decide_policy():
     )
     results += check("迭代耗尽无 source_bug → abandon", r["action"] == "abandon", f"got {r['action']}")
 
-    # Case 2b: 迭代耗尽但有高置信 source_bug → escalate（不丢弃）
+    # Case 2b: 末轮有 source_bug 但覆盖率未达标 → gen_more_with_bug（v2: 不盲目 escalate）
     r = decide_next_action(
         statement_rate=80, branch_rate=70, function_rate=100,
         statement_threshold=90, branch_threshold=90, function_threshold=100,
@@ -264,12 +266,12 @@ def test_decide_policy():
         ],
     )
     results += check(
-        "末轮有 source_bug → escalate（不 abandon）",
-        r["action"] == "escalate",
+        "末轮有 source_bug + 覆盖率未达标 → gen_more_with_bug（不 escalate）",
+        r["action"] == "gen_more_with_bug",
         f"got {r['action']}",
     )
 
-    # Case 3: 全部失败都是高置信 source_bug → escalate
+    # Case 3: 全部高置信 source_bug 但覆盖率未达标 → gen_more_with_bug（v2: 非盲目 escalate）
     r = decide_next_action(
         statement_rate=80, branch_rate=70, function_rate=100,
         statement_threshold=90, branch_threshold=90, function_threshold=100,
@@ -281,8 +283,8 @@ def test_decide_policy():
         ],
     )
     results += check(
-        "全部高置信 source_bug → escalate",
-        r["action"] == "escalate",
+        "全部高置信 source_bug + 覆盖率未达标 → gen_more_with_bug",
+        r["action"] == "gen_more_with_bug",
         f"got {r['action']}",
     )
 
@@ -340,7 +342,7 @@ def test_decide_policy():
         f"got {r['action']}",
     )
 
-    # Case 7: source_bug_ids 非空但混合失败（非末轮、无 ambiguous）→ 仍 escalate
+    # Case 7: 混合失败有 source_bug + 覆盖率未达标 → gen_more_with_bug（v2: 不丢弃继续补测）
     r = decide_next_action(
         statement_rate=80, branch_rate=70, function_rate=100,
         statement_threshold=90, branch_threshold=90, function_threshold=100,
@@ -353,9 +355,195 @@ def test_decide_policy():
         ],
     )
     results += check(
-        "混合失败但有 source_bug → escalate（不丢弃）",
+        "混合失败有 source_bug + 覆盖率未达标 → gen_more_with_bug",
+        r["action"] == "gen_more_with_bug",
+        f"got {r['action']}",
+    )
+
+    # Case 8: gen_more_with_bug — source_bug + 覆盖率仍差，非末轮
+    r = decide_next_action(
+        statement_rate=70, branch_rate=60, function_rate=80,
+        statement_threshold=90, branch_threshold=90, function_threshold=100,
+        total_cases=10, passed=8, failed=2, source_bugs=0, pending=0,
+        current_round=2, max_iterations=5,
+        verdicts=[
+            {"case_id": "c1", "preliminary_verdict": "source_code_bug", "confidence": 0.7},
+            {"case_id": "c2", "preliminary_verdict": "test_code_bug", "confidence": 0.5},
+        ],
+    )
+    results += check(
+        "source_bug + 覆盖率差 + 非末轮 → gen_more_with_bug",
+        r["action"] == "gen_more_with_bug" and r.get("skip_case_ids") == ["c1"],
+        f"got {r['action']}, skip={r.get('skip_case_ids')}",
+    )
+
+    # Case 9: 进度检测触发 escalate（两轮无进展）
+    r = decide_next_action(
+        statement_rate=70.0, branch_rate=60.0, function_rate=80.0,
+        statement_threshold=90, branch_threshold=90, function_threshold=100,
+        total_cases=10, passed=8, failed=2, source_bugs=0, pending=0,
+        current_round=3, max_iterations=5,
+        verdicts=[
+            {"case_id": "c1", "preliminary_verdict": "source_code_bug", "confidence": 0.7},
+        ],
+        previous_round_metrics={"passed": 8, "total_cases": 10, "stmt": 70.5},
+    )
+    results += check(
+        "两轮无进展 → escalate + circuit_break",
+        r["action"] == "escalate" and r.get("circuit_break") is True,
+        f"got {r['action']}, circuit={r.get('circuit_break')}",
+    )
+
+    # Case 10: 覆盖率达标 + 全 source_bug → escalate（验证 2a 正常）
+    r = decide_next_action(
+        statement_rate=92, branch_rate=85, function_rate=100,
+        statement_threshold=90, branch_threshold=80, function_threshold=100,
+        total_cases=8, passed=7, failed=1, source_bugs=0, pending=0,
+        current_round=2, max_iterations=5,
+        verdicts=[
+            {"case_id": "c1", "preliminary_verdict": "source_code_bug", "confidence": 0.7},
+        ],
+    )
+    results += check(
+        "覆盖率达标 + 全 source_bug → escalate",
         r["action"] == "escalate",
         f"got {r['action']}",
+    )
+
+    # Case 11: 末轮 + source_bug + coverage gap + no ambiguous → gen_more_with_bug（不 escalate）
+    r = decide_next_action(
+        statement_rate=70, branch_rate=60, function_rate=80,
+        statement_threshold=90, branch_threshold=90, function_threshold=100,
+        total_cases=10, passed=8, failed=2, source_bugs=0, pending=0,
+        current_round=5, max_iterations=5,
+        verdicts=[
+            {"case_id": "c1", "preliminary_verdict": "source_code_bug", "confidence": 0.7},
+        ],
+    )
+    results += check(
+        "末轮 source_bug + 无 ambiguous → gen_more_with_bug（不 escalate）",
+        r["action"] == "gen_more_with_bug",
+        f"got {r['action']}",
+    )
+
+    # Case 12: Rule 0 — orphaned > 0 → fix_only + fix_kind=missing_test_function
+    r = decide_next_action(
+        statement_rate=50, branch_rate=40, function_rate=80,
+        statement_threshold=90, branch_threshold=90, function_threshold=100,
+        total_cases=10, passed=5, failed=0, source_bugs=0, pending=2,
+        orphaned=3, orphaned_ids=["c7", "c8", "c9"],
+        current_round=2, max_iterations=5,
+    )
+    results += check(
+        "Rule 0: orphaned > 0 → fix_only + fix_kind",
+        r["action"] == "fix_only" and r.get("fix_kind") == "missing_test_function",
+        f"got {r['action']}, fix_kind={r.get('fix_kind')}",
+    )
+    results += check(
+        "Rule 0: suggested_case_ids 包含 orphaned_ids",
+        r.get("suggested_case_ids") == ["c7", "c8", "c9"],
+        f"got {r.get('suggested_case_ids')}",
+    )
+
+    # Case 13: Rule 0 优先级高于其他规则（即使覆盖率达标 + 无失败）
+    r = decide_next_action(
+        statement_rate=95, branch_rate=85, function_rate=100,
+        statement_threshold=90, branch_threshold=80, function_threshold=100,
+        total_cases=8, passed=6, failed=0, source_bugs=0, pending=0,
+        orphaned=2, orphaned_ids=["c10", "c11"],
+        current_round=2, max_iterations=5,
+    )
+    results += check(
+        "Rule 0: 优先级高于 done（覆盖率好但有 orphaned）",
+        r["action"] == "fix_only" and r.get("fix_kind") == "missing_test_function",
+        f"got {r['action']}, fix_kind={r.get('fix_kind')}",
+    )
+
+    # Case 14: orphaned=0 时不触发 Rule 0（正常走其他规则）
+    r = decide_next_action(
+        statement_rate=50, branch_rate=40, function_rate=80,
+        statement_threshold=90, branch_threshold=90, function_threshold=100,
+        total_cases=10, passed=5, failed=0, source_bugs=0, pending=2,
+        orphaned=0,
+        current_round=2, max_iterations=5,
+    )
+    results += check(
+        "Rule 0: orphaned=0 不触发 → 正常 gen_more",
+        r["action"] == "gen_more" and r.get("fix_kind") is None,
+        f"got {r['action']}, fix_kind={r.get('fix_kind')}",
+    )
+
+    # Case 15: Rule 0 — 迭代耗尽时 orphaned 让位给 Rule 3 (abandon)，防止死循环
+    r = decide_next_action(
+        statement_rate=50, branch_rate=40, function_rate=80,
+        statement_threshold=90, branch_threshold=90, function_threshold=100,
+        total_cases=10, passed=5, failed=0, source_bugs=0, pending=2,
+        orphaned=3, orphaned_ids=["c7", "c8", "c9"],
+        current_round=5, max_iterations=5,
+    )
+    results += check(
+        "Rule 0: current_round >= max_iterations → abandon（不死循环）",
+        r["action"] == "abandon",
+        f"got {r['action']}",
+    )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# _sync_case_status_from_result 验证
+# ---------------------------------------------------------------------------
+
+def test_sync_orphaned():
+    results = 0
+    print("\n=== _sync_case_status_from_result (orphaned) ===")
+
+    run_state = {
+        "files": {
+            "f.py": {
+                "test_path": "t.py",
+                "functions": {
+                    "foo": {
+                        "cases": [
+                            {"id": "c1", "test_name": "test_orphan", "status": "pending"},
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    run_result = {
+        "tests": [
+            {"case_id": "c2", "name": "test_other", "test_file": "t.py", "status": "passed"},
+        ]
+    }
+
+    # Case 12: rc=0 时标记 orphaned
+    import copy
+    s = copy.deepcopy(run_state)
+    _sync_case_status_from_result(s, run_result, runner_return_code=0)
+    results += check(
+        "pending case 无对应 test → orphaned",
+        s["files"]["f.py"]["functions"]["foo"]["cases"][0]["status"] == "orphaned",
+        f"got {s['files']['f.py']['functions']['foo']['cases'][0]['status']}",
+    )
+
+    # Case 13: rc=5 时不标记 orphaned
+    s = copy.deepcopy(run_state)
+    _sync_case_status_from_result(s, run_result, runner_return_code=5)
+    results += check(
+        "rc=5 不标 orphaned",
+        s["files"]["f.py"]["functions"]["foo"]["cases"][0]["status"] == "pending",
+        f"got {s['files']['f.py']['functions']['foo']['cases'][0]['status']}",
+    )
+
+    # Case 14: rc=None（旧调用）不标记 orphaned
+    s = copy.deepcopy(run_state)
+    _sync_case_status_from_result(s, run_result)
+    results += check(
+        "rc=None 不标 orphaned",
+        s["files"]["f.py"]["functions"]["foo"]["cases"][0]["status"] == "pending",
+        f"got {s['files']['f.py']['functions']['foo']['cases'][0]['status']}",
     )
 
     return results
@@ -370,6 +558,7 @@ if __name__ == "__main__":
     total_fails += test_fingerprint()
     total_fails += test_classification()
     total_fails += test_decide_policy()
+    total_fails += test_sync_orphaned()
 
     print(f"\n{'='*40}")
     if total_fails == 0:
