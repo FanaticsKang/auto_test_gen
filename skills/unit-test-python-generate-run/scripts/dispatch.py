@@ -948,8 +948,62 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
         # 调度结果
         if proc_info.get("result"):
             result = proc_info["result"]
-            unmet_reasons = result.get("unmet_reasons", [])
+            unmet_reasons = list(result.get("unmet_reasons", []))
             dead = result.get("dead_code", False)
+            abandon_reason = result.get("abandon_reason", "")
+            obj_blocker = result.get("objective_blocker", False)
+
+            # 自动合成补全：agent 填的优先，缺失信号自动补齐
+            if file_status in ("unmet", "abandoned"):
+                synthesized = []
+                stmt_t = cov_config.get("statement_threshold", 90)
+                branch_t = cov_config.get("branch_threshold", 90)
+                func_t = cov_config.get("function_threshold", 100)
+                stmt_r = file_cov.get("statement_rate", 0)
+                branch_r = file_cov.get("branch_rate", 0)
+                func_r = file_cov.get("function_rate", 0)
+
+                if stmt_r < stmt_t:
+                    synthesized.append(f"语句覆盖率 {stmt_r}% < {stmt_t}%")
+                if branch_r < branch_t:
+                    synthesized.append(f"分支覆盖率 {branch_r}% < {branch_t}%")
+                if func_r < func_t:
+                    synthesized.append(f"函数覆盖率 {func_r}% < {func_t}%")
+
+                f_pending = f_orphaned = f_failed = f_source_bug = 0
+                for fk, fv in rs_file.get("functions", {}).items():
+                    for c in fv.get("cases", []):
+                        st = c.get("status")
+                        if st == "pending":
+                            f_pending += 1
+                        elif st == "orphaned":
+                            f_orphaned += 1
+                        elif st in ("failed", "failed_persistent"):
+                            f_failed += 1
+                        elif st == "source_bug":
+                            f_source_bug += 1
+
+                if f_pending:
+                    synthesized.append(f"{f_pending} 个用例待生成")
+                if f_orphaned:
+                    synthesized.append(f"{f_orphaned} 个用例孤立（元数据存在但函数缺失）")
+                if f_failed:
+                    synthesized.append(f"{f_failed} 个用例失败")
+                if f_source_bug:
+                    synthesized.append(f"{f_source_bug} 个疑似源代码 bug")
+                if dead:
+                    synthesized.append("存在 dead code / 不可达分支")
+                if obj_blocker:
+                    synthesized.append("客观不可达（dead code / 编译器优化裁剪）")
+
+                if not synthesized and abandon_reason:
+                    synthesized.append(abandon_reason)
+
+                # agent 填的优先，自动的去重补充
+                unmet_reasons = list(unmet_reasons) + [r for r in synthesized if r not in unmet_reasons]
+                if not unmet_reasons:
+                    unmet_reasons = ["未达标，原因不明（请检查子 agent 日志）"]
+
             if unmet_reasons:
                 output.append(f"- **未达标项**: {'; '.join(unmet_reasons)}")
             if dead:

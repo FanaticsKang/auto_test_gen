@@ -91,17 +91,18 @@ touch {paths.heartbeat}
 
 ```
 迭代 N:
-  ① Read `.test/task_envelopes/<slug>.json`（首次）/ 读取 decide-next 输出（N>1）
-  ② 按 functions + source_snippets 生成/补充测试代码 → Write test_path
-  ③ 构造 cases_patch.json → Write /tmp/cases_patch_iter{N}.json
-  ④ Bash: analyze.py apply-and-run（内部自动 update-state → run → update-state）
-  ⑤ Read apply-and-run 的 stdout JSON → 判断是否需要处理失败
-  ⑥ 如有失败: Bash: analyze.py classify-failures → 修复 → 回到 ④（仅跑 --only-cases）
+  ① Read `.test/task_envelopes/<slug>.json`（首次）/ 读取上一轮结果（N>1）
+  ② 按 functions + source_snippets 生成/补充测试代码 + 构造 cases_patch → Write test_path + .test/cases_patch/{shard_slug}_iter{N}.json
+  ③ Bash: analyze.py apply-and-run（内部自动 update-state → run → update-state sync + orphaned 检测）
+  ④ Read stdout JSON → 检查 orphaned_case_ids，有则补 def 骨架 → 直接回 ③（不需回 ②）
+  ⑤ 判断结果: 有失败进入 ⑥，无失败进入 ⑦
+  ⑥ 如有失败: Bash: analyze.py classify-failures → 按 fix_kind 路由修复 → 回到 ③
   ⑦ Bash: analyze.py decide-next → 读 next_action
-     → action=done: 返回结果
-     → action=fix_only: 回到 ⑥
+     → action=done: 进入 ⑧ 返回结果
      → action=gen_more: 回到 ②
-     → action=abandon/escalate: 返回结果
+     → action=gen_more_with_bug: 回到 ②（跳过 skip_case_ids 对应的函数）
+     → action=fix_only: 回到 ⑥
+     → action=abandon/escalate: 进入 ⑧ 返回结果
 ```
 
 ### 步骤 ① 读取上下文
@@ -119,19 +120,19 @@ touch {paths.heartbeat}
 
 每个 case 的 cases-patch 必须包含 `"assertion_origin": "blind"`（round 1 盲测）或 `"assertion_origin": "sighted"`（round>1 补测）。
 
-### 步骤 ② 生成测试代码
+### 步骤 ② 生成测试代码 + cases-patch（合并）
 
-按函数逐一设计测试用例。规则：
+按函数逐一设计测试用例，**一步完成**：将测试代码写入 test_path，同时构造 cases-patch JSON。
+
+生成规则：
 - 每个函数的每个 `dimension` **至少一个**测试用例
 - `functional` 和 `boundary` 对所有函数都是强制维度
 - 参考 `mocks_needed` 决定是否需要 mock
 - 迭代 N>1 时专注于未覆盖的行/分支，**不删已有测试**
+- 每个 case 需要唯一 ID：`{dimension}_{序号}`，如 `functional_01`
+- **测试函数上方必须有 `# CASE_ID: <id>` 注释**
 
-每个 case 需要唯一 ID：`{dimension}_{序号}`，如 `functional_01`。
-
-**测试函数上方必须有 `# CASE_ID: <id>` 注释。**
-
-### 步骤 ③ 构造 cases-patch
+cases-patch 格式：
 
 ```json
 {
@@ -151,13 +152,17 @@ touch {paths.heartbeat}
 }
 ```
 
-### 步骤 ④ apply-and-run（核心命令，3 合 1）
+写入 `.test/cases_patch/{shard_slug}_iter{N}.json`。
+
+每个 case 的 cases-patch 必须包含 `"assertion_origin": "blind"`（round 1 盲测）或 `"assertion_origin": "sighted"`（round>1 补测）。
+
+### 步骤 ③ apply-and-run（核心命令，3 合 1）
 
 ```bash
 python {sd}/analyze.py apply-and-run \
   --baseline test/generated_unit/test_cases.json \
   --run-state {paths.state_shard} \
-  --cases-patch /tmp/cases_patch_iter{N}.json \
+  --cases-patch .test/cases_patch/{shard_slug}_iter{N}.json \
   --round {N} \
   --test-file {test_path} \
   --run-result {paths.run_result} \
@@ -168,26 +173,38 @@ python {sd}/analyze.py apply-and-run \
 
 `apply-and-run` 内部自动执行：update-state → runner.py run → update-state sync。
 
-**输出**：stdout 是 JSON，包含 `run_result_summary`、`coverage`、`case_id_index`。
+**输出**：stdout 是 JSON，包含 `run_result_summary`、`coverage`、`case_id_index`、**`orphaned_case_ids`**（cases-patch 写了但 test 文件无对应 `def test_xxx` 的 case ID 列表）。
 
 可选标志：
 - `--no-coverage`：跳过覆盖率（fix 循环只关心 pass/fail）
 - `--only-cases id1,id2`：只跑指定 case（修复后重跑）
 - `--xdist-min-tests 20`：低于 20 个测试不启用 xdist（默认）
 
-### 步骤 ⑤ 判断结果
+### 步骤 ④ 检查 orphaned cases
 
-读取 apply-and-run 的 stdout JSON：
+读取 apply-and-run stdout JSON 中的 `orphaned_case_ids` 字段：
 
 ```json
 {
-  "run_result_summary": {"return_code": 0, "passed": 5, "failed": 0, ...},
-  "coverage": {"statement_rate": 95.0, "branch_rate": 88.0, ...},
-  "case_id_index": {"functional_01": 0, ...}
+  "run_result_summary": {...},
+  "coverage": {...},
+  "case_id_index": {...},
+  "orphaned_case_ids": ["functional_03", "boundary_02"]
 }
 ```
 
-- `return_code=0`：全部通过 → 跳到 ⑦
+`orphaned_case_ids` 不为空意味着：cases-patch 声明了这些 case，但 test 文件中找不到对应的 `# CASE_ID: xxx` 注释和 `def test_xxx()` 函数。
+
+处理：
+- **有 orphaned + 还有迭代次数**：为每个 orphaned case 补充测试函数骨架（含 `# CASE_ID:` 注释），更新 cases-patch 把这些 case 的状态改为 `pending`，**直接回到步骤 ③ 执行 apply-and-run**（骨架 + case 已就绪，不需回 ② 重生成）
+- **有 orphaned + 末轮**：无需修复，记入 final_unmet_reasons："N 个用例孤立（元数据存在但函数缺失）"
+- **无 orphaned**：继续步骤 ⑤
+
+### 步骤 ⑤ 判断 pass/fail
+
+步骤 ④ 已处理完 orphaned（或标记为末轮不可修），这里只需按 return_code 分流：
+
+- `return_code=0`：无失败 → 跳到 ⑦
 - `return_code=1`：有失败 → 进入 ⑥
 - `return_code=2/3/4/5`：工具/解析/环境/无测试错误 → 记录原因，进入 ⑦
 
@@ -202,12 +219,12 @@ python {sd}/analyze.py classify-failures \
   --output .test/verdicts/{shard_slug}.json
 ```
 
-读取 verdicts.json，按 `preliminary_verdict` 处理：
+读取 verdicts.json，按 `preliminary_verdict` 决定修复路径：
 
 | verdict | 处理 |
 |--------|------|
-| `test_code_bug` | Edit 修复测试代码 → 回到 ④（加 `--only-cases <失败的case_ids> --no-coverage`） |
-| `source_code_bug` | 调用 `record-bug` 登记 |
+| `test_code_bug` | Edit 修复测试代码 → 回 ③（加 `--only-cases <失败的case_ids> --no-coverage`） |
+| `source_code_bug` | 调用 `record-bug` 登记，不修测试 |
 | `ambiguous` | 先按 test_code_bug 修，同 case 失败 2 次升级为 source_code_bug |
 
 **断言保护规则**：修复 `assertion_origin=blind` 的 case 时：
@@ -220,7 +237,7 @@ python {sd}/analyze.py classify-failures \
 python {sd}/analyze.py record-bug \
   --bugs-file {paths.bug_shard} \
   --file {source_path} --function {func_key} --case-id {case_id} \
-  --round {N} --traceback-file /tmp/tb.txt \
+  --round {N} --traceback-file .test/traces/{shard_slug}_iter{N}.txt \
   --reason "一句话判断"
 ```
 
@@ -236,24 +253,39 @@ python {sd}/analyze.py decide-next \
   --output .test/next_actions/{shard_slug}.json
 ```
 
-读取输出，按 `action` 字段决定：
+读取输出，按 `action` + `fix_kind` 字段决定：
 
-| action | 含义 | 下一步 |
-|--------|------|--------|
-| `done` | 覆盖率达标 | 进入步骤 ⑧ 返回结果 |
-| `gen_more` | 需要补测 | 回到 ② |
-| `fix_only` | 只需修失败 | 回到 ⑥ |
-| `abandon` | 迭代耗尽 | 进入 ⑧ |
-| `escalate` | source_bug | 进入 ⑧ |
+| action | fix_kind | 含义 | 下一步 |
+|--------|----------|------|--------|
+| `done` | — | 覆盖率达标 | 进入步骤 ⑧ 返回结果 |
+| `gen_more` | — | 需要补测 | 回到 ② |
+| `gen_more_with_bug` | — | 有 source_bug + 覆盖率仍差 | 回到 ②，**跳过 `skip_case_ids` 对应的函数**（不为其生成新 case） |
+| `fix_only` | _(空)_ | 只需修失败（来自 classify-failures verdicts） | 回到 ⑥ |
+| `fix_only` | `missing_test_function` | **Rule 0 兜底**：agent step ④ 漏了处理 orphaned | 按 `suggested_case_ids` 创建缺失的 `def test_xxx` 函数 → 回 ③ |
+| `abandon` | — | 迭代耗尽 | 进入 ⑧ |
+| `escalate` | — | source_bug | 进入 ⑧ |
 
-如果 `action=gen_more`，可以用 `gaps` 命令获取精确缺口：
+**`fix_kind=missing_test_function` 处理细节**（Rule 0 兜底路径）：
+1. 从 `next_action.suggested_case_ids` 获取 orphaned case ID 列表
+2. 从 run_state 的对应 case 条目读取 `test_name`、`dimension`、`description`
+3. 在 test 文件中为每个 case 创建对应的 `def test_xxx():` 函数骨架
+4. 函数体至少包含基础 setup + 一个有意义断言（基于 source_snippets 中的签名/docstring）
+5. 函数上方加 `# CASE_ID: <id>` 注释
+6. 更新 cases-patch，把这些 case 的 `status` 改为 `pending`
+7. 回到步骤 ③ 执行 apply-and-run
+
+**重要**：此路径是 Rule 0 兜底——意味着 agent 在 step ④ 漏了处理 orphaned。处理完毕必须在 `final_unmet_reasons` 中注明 "Rule 0 兜底修复了 N 个 orphaned case"。
+
+**`circuit_break=True` 处理**：如果 `next_action.circuit_break` 为 `true`，说明当前 action 是兜底触发的（如进度检测死循环 → escalate），需要在 `final_unmet_reasons` 中注明原因，并在返回前将 `abandon_reason` 设为 `next_action.reason`。
+
+如果 `action=gen_more` 或 `gen_more_with_bug`，可以用 `gaps` 命令获取精确缺口（`gen_more_with_bug` 时 gaps 会自动排除 `skip_case_ids` 对应的函数）：
 
 ```bash
 python {sd}/analyze.py gaps \
   --run-result {paths.run_result} \
   --baseline test/generated_unit/test_cases.json \
   --run-state {paths.state_shard} \
-  --output /tmp/gaps_{slug}_iter{N}.json
+  --output .test/gaps/{shard_slug}_iter{N}.json
 ```
 
 ### 步骤 ⑦b Bug 复核（Phase 5，与 escalate 同触发）
@@ -315,11 +347,21 @@ python {sd}/dispatch.py verify-repro \
   "objective_blocker": false,
   "dead_code": false,
   "dead_code_locations": [],
-  "iterations_used": 3
+  "iterations_used": 3,
+  "orphaned_case_ids": [],
+  "source_bug_ids": [],
+  "abandon_reason": "",
+  "action_on_exit": "done"
 }
 ```
 
 覆盖率取值：从 `paths.run_result` 的 `coverage[source_path].functions[func_key]` 读取 `statement_rate`。
+
+新字段说明：
+- `orphaned_case_ids`：步骤 ④ 检测到的孤立 case ID 列表（即使已全部修复也记录曾检测到的）
+- `source_bug_ids`：步骤 ⑥ 中通过 `record-bug` 登记的 source_bug case ID 列表
+- `abandon_reason`：若 `action_on_exit` 为 `abandon`，填入原因（如 "迭代耗尽：覆盖率未达标"）
+- `action_on_exit`：退出时的最终 action（`done`/`abandon`/`escalate`）
 
 ---
 

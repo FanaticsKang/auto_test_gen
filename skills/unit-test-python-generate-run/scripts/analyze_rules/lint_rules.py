@@ -28,7 +28,7 @@ REQUIRED_FIELDS = ("id", "dimension", "test_name", "description", "status")
 
 # 合法状态
 VALID_STATUSES = {"pending", "passed", "failed", "failed_persistent",
-                  "source_bug", "skipped", "fixed_pending_rerun"}
+                  "source_bug", "skipped", "fixed_pending_rerun", "orphaned"}
 
 # 合法 assertion_origin 值
 VALID_ASSERTION_ORIGINS = {"blind", "sighted"}

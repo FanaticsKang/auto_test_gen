@@ -38,6 +38,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 RUN_STATE_VERSION = "1.0"
 
@@ -200,12 +201,17 @@ def _apply_patch(run_state, baseline, patch, round_n):
     return {"updated_funcs": updated_funcs, "new_cases": new_cases, "total_cases": total_cases}
 
 
-def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
+def _sync_case_status_from_result(run_state: dict, run_result: dict,
+                                   runner_return_code: int = None) -> int:
     """从 run_result 的 tests[] 读取测试结果，更新 run_state 中对应 case 的 status。
 
     映射策略：
     1. 优先用 case_id 匹配（runner.py 从 CASE_ID 注释反查的 t["case_id"]）
     2. 回退到 (test_file, bare_name) 复合 key，bare_name 会去掉 pytest 参数化后缀 [...]
+
+    runner_return_code: pytest 返回码。仅在 rc ∈ {0, 1} 时才认为 runner
+    真的执行了测试，才允许标记 orphaned。rc=5（无测试）或 rc=2/3/4
+    （环境/解析错）时不标记，避免误判。
 
     返回更新的 case 数量。
     """
@@ -225,7 +231,9 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
         tf = t.get("test_file", "")
         by_composite[(tf, bare)] = t
 
+    can_mark_orphaned = runner_return_code in (0, 1)
     synced = 0
+    orphaned_ids = []
     for src_path, rs_file in run_state.get("files", {}).items():
         test_path = rs_file.get("test_path", "")
         for func_key, rs_func in rs_file.get("functions", {}).items():
@@ -236,6 +244,14 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
                 if not t:
                     t = by_composite.get((test_path, case.get("test_name", "")))
                 if not t:
+                    # runner 跑过测试但找不到这个 case 的对应 test 函数
+                    if (can_mark_orphaned
+                            and case.get("status") == "pending"
+                            and (by_case_id or by_composite)):
+                        case["status"] = "orphaned"
+                        case["failure_reason"] = "cases-patch 写了但 test 文件无对应 def"
+                        orphaned_ids.append(case.get("id"))
+                        synced += 1
                     continue
 
                 new_status = None
@@ -261,18 +277,22 @@ def _sync_case_status_from_result(run_state: dict, run_result: dict) -> int:
                             fps = case.setdefault("traceback_fingerprints", [])
                             if fp not in fps:
                                 fps.append(fp)
+
+    run_state["_last_sync_orphaned"] = orphaned_ids
     return synced
 
 
-def _compute_round_entry(run_state: dict, round_n: int) -> dict:
-    """从当前 run_state 计算指定 round 的元数据快照。"""
+def _compute_round_entry(run_state: dict, round_n: int, run_result: Optional[dict] = None) -> dict:
+    """从当前 run_state 和 run_result 计算指定 round 的元数据快照。"""
     new_cases = 0
     passed = 0
     failed = 0
     source_bugs = 0
+    total_cases = 0
     for fi in run_state.get("files", {}).values():
         for f in fi.get("functions", {}).values():
             for c in f.get("cases", []):
+                total_cases += 1
                 if c.get("round_added") == round_n:
                     new_cases += 1
                 st = c.get("status")
@@ -282,14 +302,22 @@ def _compute_round_entry(run_state: dict, round_n: int) -> dict:
                     failed += 1
                 elif st == "source_bug":
                     source_bugs += 1
-    return {
+    entry = {
         "round": round_n,
         "ended_at": datetime.now().isoformat(timespec="seconds"),
         "new_cases": new_cases,
         "passed": passed,
         "failed": failed,
         "source_bugs": source_bugs,
+        "total_cases": total_cases,
     }
+    if run_result:
+        cov = run_result.get("summary", {}).get("coverage", {})
+        if cov:
+            entry["stmt"] = round(cov.get("statement_rate", 0), 2)
+            entry["branch"] = round(cov.get("branch_rate", 0), 2)
+            entry["func"] = round(cov.get("function_rate", 0), 2)
+    return entry
 
 
 def cmd_update_state(args):
@@ -348,18 +376,22 @@ def cmd_update_state(args):
 
     # 可选：从 run_result 自动同步 case 状态
     synced = 0
+    run_result = None
     if args.run_result:
         rr_path = Path(args.run_result)
         if rr_path.is_file():
             run_result = json.loads(rr_path.read_text(encoding="utf-8"))
-            synced = _sync_case_status_from_result(run_state, run_result)
+            synced = _sync_case_status_from_result(
+                run_state, run_result,
+                runner_return_code=run_result.get("return_code"),
+            )
 
     # 追加 per-round 元数据
     rounds = run_state.setdefault("rounds", [])
     existing_round_idx = next(
         (i for i, r in enumerate(rounds) if r.get("round") == args.round), None
     )
-    round_entry = _compute_round_entry(run_state, args.round)
+    round_entry = _compute_round_entry(run_state, args.round, run_result=run_result)
     if existing_round_idx is not None:
         rounds[existing_round_idx] = round_entry
     else:
@@ -980,14 +1012,16 @@ def cmd_apply_and_run(args):
     if rr_path.is_file():
         run_result_data = json.loads(rr_path.read_text(encoding="utf-8"))
         run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
-        synced = _sync_case_status_from_result(run_state, run_result_data)
+        synced = _sync_case_status_from_result(
+            run_state, run_result_data, runner_return_code=proc.returncode
+        )
 
         # Append round entry
         rounds = run_state.setdefault("rounds", [])
         existing_round_idx = next(
             (i for i, r in enumerate(rounds) if r.get("round") == args.round), None
         )
-        round_entry = _compute_round_entry(run_state, args.round)
+        round_entry = _compute_round_entry(run_state, args.round, run_result=run_result_data)
         if existing_round_idx is not None:
             rounds[existing_round_idx] = round_entry
         else:
@@ -1020,6 +1054,7 @@ def cmd_apply_and_run(args):
         "coverage": cov_summary,
         "case_id_index": run_result_final.get("case_id_index", {}),
         "run_state_summary": run_state_final.get("summary", {}),
+        "orphaned_case_ids": run_state_final.get("_last_sync_orphaned", []),
     }
 
     print(json.dumps(output, indent=2, ensure_ascii=False))
@@ -1109,7 +1144,8 @@ def cmd_decide_next(args):
     func_rate = cov_summary.get("function_rate", 0)
 
     # 统计 case 状态
-    total_cases = passed = failed = source_bugs = pending = 0
+    total_cases = passed = failed = source_bugs = pending = orphaned = 0
+    orphaned_ids_list = []
     for fi in run_state.get("files", {}).values():
         for f in fi.get("functions", {}).values():
             for c in f.get("cases", []):
@@ -1123,6 +1159,17 @@ def cmd_decide_next(args):
                     source_bugs += 1
                 elif st == "pending":
                     pending += 1
+                elif st == "orphaned":
+                    orphaned += 1
+                    orphaned_ids_list.append(c.get("id"))
+
+    # 构建上一轮 metrics 快照（供进度检测）
+    previous_round_metrics = None
+    if args.round > 1:
+        for r in run_state.get("rounds", []):
+            if r.get("round") == args.round - 1:
+                previous_round_metrics = r
+                break
 
     # 加载 verdicts（可选）
     verdicts = None
@@ -1146,6 +1193,9 @@ def cmd_decide_next(args):
         current_round=args.round,
         max_iterations=args.max_iterations,
         verdicts=verdicts,
+        previous_round_metrics=previous_round_metrics,
+        orphaned=orphaned,
+        orphaned_ids=orphaned_ids_list if orphaned_ids_list else None,
     )
 
     out_path = Path(args.output)
