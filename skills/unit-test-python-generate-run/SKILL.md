@@ -167,7 +167,6 @@ AskUserQuestion:
 ```bash
 python scripts/dispatch.py claim \
   --process test/generated_unit/generate_process.json \
-  --baseline test/generated_unit/test_cases.json \
   --number 3 \
   --stale-seconds 600
 ```
@@ -208,7 +207,6 @@ python scripts/dispatch.py claim \
 ```bash
 python scripts/dispatch.py prepare-shard \
   --process test/generated_unit/generate_process.json \
-  --baseline test/generated_unit/test_cases.json \
   --file <source_path> \
   --round <current_round> \
   --repo-root . \
@@ -277,7 +275,7 @@ python scripts/dispatch.py verify-artifacts \
 # 8.1 合并所有 per-file state shards
 python scripts/dispatch.py merge-state \
   --shards-dir .test/state_shards \
-  --baseline test/generated_unit/test_cases.json \
+  --process test/generated_unit/generate_process.json \
   --output test/generated_unit/test_run_state.json
 
 # 8.2 合并所有 per-file bug shards
@@ -287,11 +285,10 @@ python scripts/dispatch.py merge-bugs \
 
 # 8.3 生成按文件的分析报告（从 .test/run_results 目录聚合覆盖率）
 python scripts/dispatch.py report \
-  --baseline test/generated_unit/test_cases.json \
+  --process test/generated_unit/generate_process.json \
   --run-state test/generated_unit/test_run_state.json \
   --run-results-dir .test/run_results \
   --source-bugs .test/source_bugs.json \
-  --process test/generated_unit/generate_process.json \
   --output test/generated_unit/per_file_report.md \
   --format markdown
 ```
@@ -322,6 +319,16 @@ python scripts/dispatch.py report \
     "core/parser.py": {
       "file_md5": "abc123",
       "test_path": "test/generated_unit/core/test_parser.py",
+      "functions": {
+        "parse_header": {
+          "dimensions": ["functional", "boundary", "exception"],
+          "line_range": [10, 50],
+          "signature": "def parse_header(data: bytes) -> dict",
+          "mocks_needed": [],
+          "test_optional": false,
+          "func_md5": "def123"
+        }
+      },
       "status": "pending",
       "claim_round": 0,
       "attempt_count": 0,

@@ -16,9 +16,9 @@ claim 对比 batch：batch 只查不写、适合 dry-run；claim 原子写回状
 
 用法：
   python dispatch.py init   --baseline test/generated_unit/test_cases.json --output test/generated_unit/generate_process.json
-  python dispatch.py batch  --process  test/generated_unit/generate_process.json --baseline test/generated_unit/test_cases.json --number 3
-  python dispatch.py claim  --process  test/generated_unit/generate_process.json --baseline test/generated_unit/test_cases.json --number 3 [--stale-seconds 1800]
-  python dispatch.py report --baseline ... --run-state ... [--run-result ... | --run-results-dir ...] --output .test/report.md
+  python dispatch.py batch  --process  test/generated_unit/generate_process.json --number 3
+  python dispatch.py claim  --process  test/generated_unit/generate_process.json --number 3 [--stale-seconds 1800]
+  python dispatch.py report --process ... --run-state ... [--run-result ... | --run-results-dir ...] --output .test/report.md
 """
 
 import argparse
@@ -140,12 +140,11 @@ def _shard_paths(shards_root: str, src_path: str) -> dict:
     }
 
 
-def _build_file_info(src_path, proc_files, bl_files, cov_config, max_iter, shards_root):
+def _build_file_info(src_path, proc_files, cov_config, max_iter, shards_root):
     """构造 batch / claim 共用的单文件返回结构。"""
-    bl_file = bl_files.get(src_path, {})
+    proc_file = proc_files[src_path]
     functions = {}
-    for func_key, fmeta in bl_file.get("functions", {}).items():
-        # test_optional 函数不发给子 agent
+    for func_key, fmeta in proc_file.get("functions", {}).items():
         if fmeta.get("test_optional"):
             continue
         functions[func_key] = {
@@ -156,8 +155,8 @@ def _build_file_info(src_path, proc_files, bl_files, cov_config, max_iter, shard
         }
     return {
         "source_path": src_path,
-        "test_path": proc_files[src_path].get("test_path", bl_file.get("test_path", "")),
-        "file_md5": proc_files[src_path].get("file_md5", ""),
+        "test_path": proc_file.get("test_path", ""),
+        "file_md5": proc_file.get("file_md5", ""),
         "functions": functions,
         "coverage_config": cov_config,
         "max_iterations": max_iter,
@@ -186,9 +185,21 @@ def cmd_init(args):
 
     files = {}
     for src_path, finfo in baseline.get("files", {}).items():
+        # 嵌入函数元数据，供后续调度命令直接使用，无需再读 baseline
+        functions = {}
+        for func_key, fmeta in finfo.get("functions", {}).items():
+            functions[func_key] = {
+                "dimensions": fmeta.get("dimensions", []),
+                "line_range": fmeta.get("line_range", []),
+                "signature": fmeta.get("signature", ""),
+                "mocks_needed": fmeta.get("mocks_needed", []),
+                "test_optional": fmeta.get("test_optional", False),
+                "func_md5": fmeta.get("func_md5", ""),
+            }
         files[src_path] = {
             "file_md5": finfo.get("file_md5", ""),
             "test_path": finfo.get("test_path", ""),
+            "functions": functions,
             "status": "pending",
             "claim_round": 0,
             "attempt_count": 0,
@@ -323,8 +334,8 @@ def _count_statuses(proc_files):
     return counts
 
 
-def _resolve_common(process, baseline):
-    cov_config = process.get("coverage_config", baseline.get("coverage_config", {}))
+def _resolve_common(process):
+    cov_config = process.get("coverage_config", {})
     max_iter = process.get("max_iterations", 5)
     shards_root = process.get("shards_root", ".test")
     return cov_config, max_iter, shards_root
@@ -332,20 +343,15 @@ def _resolve_common(process, baseline):
 
 def cmd_batch(args):
     process = _load_json(args.process)
-    baseline = _load_json(args.baseline)
 
     if not process:
         print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
         sys.exit(1)
-    if not baseline:
-        print(f"错误: 基线 {args.baseline} 不存在或为空", file=sys.stderr)
-        sys.exit(1)
 
-    cov_config, max_iter, shards_root = _resolve_common(process, baseline)
+    cov_config, max_iter, shards_root = _resolve_common(process)
     proc_files = process.get("files", {})
-    bl_files = baseline.get("files", {})
 
-    candidates = _select_candidates(proc_files, args.stale_seconds, bl_files, shards_root)
+    candidates = _select_candidates(proc_files, args.stale_seconds, proc_files, shards_root)
     batch_paths = candidates[:args.number]
 
     overall = _overall_state(proc_files)
@@ -358,7 +364,7 @@ def cmd_batch(args):
         return
 
     batch = [
-        _build_file_info(p, proc_files, bl_files, cov_config, max_iter, shards_root)
+        _build_file_info(p, proc_files, cov_config, max_iter, shards_root)
         for p in batch_paths
     ]
 
@@ -441,18 +447,13 @@ def _check_circuit_break(proc_files):
 def cmd_claim(args):
     process_path = Path(args.process)
     process = _load_json(process_path)
-    baseline = _load_json(args.baseline)
 
     if not process:
         print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
         sys.exit(1)
-    if not baseline:
-        print(f"错误: 基线 {args.baseline} 不存在或为空", file=sys.stderr)
-        sys.exit(1)
 
-    cov_config, max_iter, shards_root = _resolve_common(process, baseline)
+    cov_config, max_iter, shards_root = _resolve_common(process)
     proc_files = process.get("files", {})
-    bl_files = baseline.get("files", {})
 
     # AIMD 节流
     max_number = args.max_number or args.number
@@ -466,7 +467,7 @@ def cmd_claim(args):
     # 熔断检测
     circuit_break, circuit_reason = _check_circuit_break(proc_files)
 
-    candidates = _select_candidates(proc_files, args.stale_seconds, bl_files, shards_root)
+    candidates = _select_candidates(proc_files, args.stale_seconds, proc_files, shards_root)
 
     # 过滤 effective_attempt_count >= 3 的文件（自动 abandoned）
     abandoned_now = []
@@ -513,7 +514,7 @@ def cmd_claim(args):
 
     overall = _overall_state(proc_files)
     batch = [
-        _build_file_info(p, proc_files, bl_files, cov_config, max_iter, shards_root)
+        _build_file_info(p, proc_files, cov_config, max_iter, shards_root)
         for p in claim_paths
     ]
 
@@ -627,16 +628,16 @@ def _aggregate_run_results_dir(results_dir: Path) -> dict:
     }
 
 
-def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> str:
+def _render_markdown(process, run_state, run_result, source_bugs) -> str:
     rs_files = run_state.get("files", {})
     run_cov = run_result.get("coverage", {})
     tests_by_case = _collect_tests_by_case(run_result)
     bugs_by_file = _group_bugs_by_file(source_bugs)
-    proc_files = (process or {}).get("files", {})
+    proc_files = process.get("files", {})
 
-    bl_files = baseline.get("files", {})
+    bl_files = proc_files
     cov_summary = run_result.get("summary", {}).get("coverage", {})
-    cov_config = baseline.get("coverage_config", {})
+    cov_config = process.get("coverage_config", {})
 
     # ---- Pre-compute statistics ----
     # File status groups
@@ -926,7 +927,8 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     output.append("\n## 9. 文件级详细分析\n")
 
     # 文件详细部分：优先展示已完成的文件
-    bl_keys = list(baseline.get("files", {}).keys())
+    bl_keys = list(proc_files.keys())
+
     def _file_sort_key(p):
         proc_info = proc_files.get(p, {})
         status = proc_info.get("status", "")
@@ -935,7 +937,7 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     bl_keys.sort(key=lambda p: (_file_sort_key(p), p))
 
     for src_path in bl_keys:
-        bl_file = baseline["files"][src_path]
+        bl_file = proc_files[src_path]
         rs_file = rs_files.get(src_path, {})
         file_cov = run_cov.get(src_path, {})
         file_bugs = bugs_by_file.get(src_path, [])
@@ -1152,15 +1154,15 @@ def _render_markdown(baseline, run_state, run_result, source_bugs, process) -> s
     return "\n".join(output) + "\n"
 
 
-def _render_json_report(baseline, run_state, run_result, source_bugs, process) -> str:
+def _render_json_report(process, run_state, run_result, source_bugs) -> str:
     rs_files = run_state.get("files", {})
     run_cov = run_result.get("coverage", {})
     bugs_by_file = _group_bugs_by_file(source_bugs)
-    proc_files = (process or {}).get("files", {})
+    proc_files = process.get("files", {})
 
     files = []
-    for src_path in sorted(baseline.get("files", {}).keys()):
-        bl_file = baseline["files"][src_path]
+    for src_path in sorted(proc_files.keys()):
+        bl_file = proc_files[src_path]
         rs_file = rs_files.get(src_path, {})
         file_cov = run_cov.get(src_path, {})
         proc_info = proc_files.get(src_path, {})
@@ -1221,13 +1223,12 @@ def _render_json_report(baseline, run_state, run_result, source_bugs, process) -
 
 
 def cmd_report(args):
-    baseline = _load_json(args.baseline)
+    process = _load_json(args.process)
     run_state = _load_json(args.run_state)
     source_bugs = _load_json(args.source_bugs) if args.source_bugs else {}
-    process = _load_json(args.process) if args.process else {}
 
-    if not baseline:
-        print(f"错误: 基线 {args.baseline} 为空或不存在", file=sys.stderr)
+    if not process:
+        print(f"错误: 调度状态 {args.process} 为空或不存在", file=sys.stderr)
         sys.exit(1)
 
     # run_result 优先级：--run-result > --run-results-dir > 空
@@ -1241,9 +1242,9 @@ def cmd_report(args):
         sys.exit(1)
 
     if args.format == "markdown":
-        text = _render_markdown(baseline, run_state, run_result, source_bugs, process)
+        text = _render_markdown(process, run_state, run_result, source_bugs)
     else:
-        text = _render_json_report(baseline, run_state, run_result, source_bugs, process)
+        text = _render_json_report(process, run_state, run_result, source_bugs)
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1336,13 +1337,9 @@ def cmd_prepare_shard(args):
     sub-agent 读取这一个文件就能开始工作，无需额外 Read。
     """
     process = _load_json(args.process)
-    baseline = _load_json(args.baseline)
 
     if not process:
         print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
-        sys.exit(1)
-    if not baseline:
-        print(f"错误: 基线 {args.baseline} 不存在或为空", file=sys.stderr)
         sys.exit(1)
 
     src_path = args.file
@@ -1351,15 +1348,14 @@ def cmd_prepare_shard(args):
         print(f"错误: {src_path} 不在调度状态中", file=sys.stderr)
         sys.exit(1)
 
-    cov_config, max_iter, shards_root = _resolve_common(process, baseline)
+    cov_config, max_iter, shards_root = _resolve_common(process)
     info = proc_files[src_path]
-    bl_file = baseline.get("files", {}).get(src_path, {})
     paths = _shard_paths(shards_root, src_path)
     slug = paths["slug"]
 
     # 收集函数信息（排除 test_optional）
     functions = {}
-    for func_key, fmeta in bl_file.get("functions", {}).items():
+    for func_key, fmeta in info.get("functions", {}).items():
         if fmeta.get("test_optional"):
             continue
         functions[func_key] = {
@@ -1424,7 +1420,7 @@ def cmd_prepare_shard(args):
     if src_lines:
         # 先评估所有函数的 oracle_quality（盲测模式才需要）
         if use_blind:
-            for func_key, fmeta in bl_file.get("functions", {}).items():
+            for func_key, fmeta in info.get("functions", {}).items():
                 if fmeta.get("test_optional"):
                     continue
                 lr = fmeta.get("line_range", [0, 0])
@@ -1433,7 +1429,7 @@ def cmd_prepare_shard(args):
                 oracle_quality_map[func_key] = oq
 
         pad = 20
-        for func_key, fmeta in bl_file.get("functions", {}).items():
+        for func_key, fmeta in info.get("functions", {}).items():
             if fmeta.get("test_optional"):
                 continue
             lr = fmeta.get("line_range", [0, 0])
@@ -1473,7 +1469,7 @@ def cmd_prepare_shard(args):
     envelope = {
         "shard_slug": slug,
         "source_path": src_path,
-        "test_path": info.get("test_path", bl_file.get("test_path", "")),
+        "test_path": info.get("test_path", ""),
         "file_md5": info.get("file_md5", ""),
         "round": args.round,
         "scope_sources": [src_path],
@@ -1579,9 +1575,9 @@ def cmd_verify_repro(args):
 RUN_STATE_VERSION = "1.0"
 
 
-def _init_run_state(baseline: dict, baseline_path) -> dict:
+def _init_run_state(process: dict, process_path) -> dict:
     files = {}
-    for src_path, finfo in baseline.get("files", {}).items():
+    for src_path, finfo in process.get("files", {}).items():
         func_entries = {}
         for func_key, fmeta in finfo.get("functions", {}).items():
             func_entries[func_key] = {
@@ -1596,8 +1592,8 @@ def _init_run_state(baseline: dict, baseline_path) -> dict:
 
     return {
         "version": RUN_STATE_VERSION,
-        "baseline_ref": str(baseline_path),
-        "baseline_version": baseline.get("version", ""),
+        "baseline_ref": str(process_path),
+        "baseline_version": process.get("version", ""),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "last_round": 0,
         "summary": {
@@ -1617,13 +1613,13 @@ def _init_run_state(baseline: dict, baseline_path) -> dict:
 
 
 def cmd_merge_state(args):
-    baseline_path = Path(args.baseline)
-    baseline = _load_json(baseline_path)
-    if not baseline:
-        print(f"错误: 基线 {args.baseline} 为空或不存在", file=sys.stderr)
+    process_path = Path(args.process)
+    process = _load_json(process_path)
+    if not process:
+        print(f"错误: 调度状态 {args.process} 为空或不存在", file=sys.stderr)
         sys.exit(1)
 
-    merged = _init_run_state(baseline, baseline_path)
+    merged = _init_run_state(process, process_path)
     merged_files = merged["files"]
 
     shards_dir = Path(args.shards_dir)
@@ -1776,7 +1772,6 @@ def main():
     # batch
     p_batch = sub.add_parser("batch", help="只读查询 n 个待处理文件")
     p_batch.add_argument("--process", required=True, help="generate_process.json 路径")
-    p_batch.add_argument("--baseline", required=True, help="test_cases.json 路径")
     p_batch.add_argument("--number", type=int, required=True, help="选取文件数")
     p_batch.add_argument("--stale-seconds", type=int, default=0,
                          help=">0 时，把 claimed_at 超过该秒数仍停在"
@@ -1786,7 +1781,6 @@ def main():
     p_claim = sub.add_parser("claim",
                               help="原子选 N 个，标记为\"执行中\"；返回结构同 batch")
     p_claim.add_argument("--process", required=True)
-    p_claim.add_argument("--baseline", required=True)
     p_claim.add_argument("--number", type=int, required=True)
     p_claim.add_argument("--max-number", type=int, default=None,
                          help="AIMD 允许的最大并发度（默认等于 --number）")
@@ -1795,7 +1789,7 @@ def main():
 
     # report
     p_report = sub.add_parser("report", help="按文件输出测试分析报告")
-    p_report.add_argument("--baseline", required=True)
+    p_report.add_argument("--process", required=True, help="generate_process.json 路径")
     p_report.add_argument("--run-state", required=True)
     p_report.add_argument("--run-result", default=None,
                           help="全量模式：单个聚合 run_result.json")
@@ -1804,8 +1798,6 @@ def main():
                                "自动聚合")
     p_report.add_argument("--source-bugs", default=None,
                           help="可选；source_bugs.json 路径")
-    p_report.add_argument("--process", default=None,
-                          help="可选；generate_process.json 路径（含子 agent 结果）")
     p_report.add_argument("--output", required=True)
     p_report.add_argument("--format", choices=["markdown", "json"], default="markdown")
 
@@ -1821,7 +1813,6 @@ def main():
     p_ps = sub.add_parser("prepare-shard",
                           help="为指定文件生成 task_envelope.json")
     p_ps.add_argument("--process", required=True, help="generate_process.json 路径")
-    p_ps.add_argument("--baseline", required=True, help="test_cases.json 路径")
     p_ps.add_argument("--file", required=True, help="源文件路径")
     p_ps.add_argument("--round", type=int, default=1, help="当前轮数")
     p_ps.add_argument("--repo-root", default=".", help="仓库根目录")
@@ -1842,7 +1833,7 @@ def main():
                            help="合并 per-file state shards → 统一 run_state")
     p_ms.add_argument("--shards-dir", required=True,
                        help="存放 state shards 的目录（例如 .test/state_shards）")
-    p_ms.add_argument("--baseline", required=True, help="test_cases.json 路径")
+    p_ms.add_argument("--process", required=True, help="generate_process.json 路径")
     p_ms.add_argument("--output", required=True, help="统一 run_state 输出路径")
 
     # merge-bugs
