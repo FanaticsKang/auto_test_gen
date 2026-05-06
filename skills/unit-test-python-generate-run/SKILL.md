@@ -212,28 +212,29 @@ python .claude/skills/unit-test-python-generate-run/scripts/dispatch.py claim --
 
 ### 步骤 5：派发子 agent
 
-对 claim 返回的 `files[]` 中每个文件，用 `dispatch.py prepare-shard` 生成 task_envelope，再并发派发 `python-test-gen-agent`。
+用 `dispatch.py prepare-shard` 从 claim batch 批量生成 task_envelope，再并发派发 `python-test-gen-agent`。
 
-#### 5a. 生成 task_envelope
+#### 5a. 批量生成 task_envelope
 
-对每个 claim 到的文件，调用 prepare-shard 一次性生成 sub-agent 所需的全部上下文：
+从步骤 4 的 claim batch 文件一次性生成所有 sub-agent 所需的 task_envelope：
 
 ```bash
 python .claude/skills/unit-test-python-generate-run/scripts/dispatch.py prepare-shard \
-  --process test/generated_unit/generate_process.json \
-  --file <source_path> \
-  --round <current_round> \
-  --repo-root . \
-  --output .test/task_envelopes/<paths.slug>.json
+  --from-claim .test/claim_batch/<步骤4输出的时间戳>.json
 ```
 
-`prepare-shard` 会读取现有 shard（run_result、state_shard、verdicts、next_action），收集源码片段（每个函数 ±20 行），产出完整的 task_envelope.json。sub-agent 只需读这一个文件即可开始工作，无需额外 Read 源文件。
+说明：
+1. `--from-claim` 读取 claim batch 中的 `files[]`，从 `generate_process.json` 自动推导 round 和 shard 路径。
+2. 每个 envelope 输出到 `.test/task_envelopes/<slug>.json`。
+3. stdout 输出 JSON，`generated[]` 数组中每个元素带 `source_path` 和 `envelope_path`，供步骤 5b 使用。
+4. `prepare-shard` 会读取现有 shard（run_result、state_shard、verdicts、next_action），收集源码片段（每个函数 ±20 行）。sub-agent 只需读这一个文件即可开始工作。
+5. 单文件兜底：`prepare-shard --file <source_path> --round <n> --output <path>` 仍可用。
 
 #### 5b. 并发派发
 
-在同一条回复里，对每个 task_envelope 用 `Agent` 工具启动 `python-test-gen-agent`，提示词模板：
+在同一条回复里，对 `generated[]` 中每个 envelope 用 `Agent` 工具启动 `python-test-gen-agent`，提示词模板：
 
-> 读取 `.test/task_envelopes/<slug>.json`，按其 JSON 内容中定义的任务执行。
+> 读取 `<envelope_path>`，按其 JSON 内容中定义的任务执行。
 
 所有子 agent 并发启动（`run_in_background: false`），等待全部完成后进入步骤 6。
 

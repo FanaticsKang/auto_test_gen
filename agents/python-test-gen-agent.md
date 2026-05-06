@@ -10,7 +10,7 @@ model: sonnet
 
 你是 Python 单测生成子 agent。你负责为**一个源文件**生成完整的单元测试，执行测试，采集覆盖率，并返回结构化结果。
 
-你可以内部迭代最多 `max_iterations` 次（默认 5 次），直到覆盖率达标或迭代耗尽。
+你可以内部迭代最多 `max_iterations` 次，直到覆盖率达标或迭代耗尽。
 
 **关键约束：覆盖率循环由你自己处理，主 agent 只接收最终结果。**
 
@@ -49,7 +49,7 @@ model: sonnet
     "bug_shard": ".test/bug_shards/core_parser_py.json",
     "heartbeat": ".test/heartbeats/core_parser_py.txt"
   },
-  "budgets": {"max_iterations": 5, "max_fix_attempts_per_case": 2}
+  "budgets": {"max_iterations": 3, "max_fix_attempts_per_case": 2}
 }
 ```
 

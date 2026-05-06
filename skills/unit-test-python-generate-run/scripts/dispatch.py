@@ -1339,29 +1339,20 @@ def cmd_verify_artifacts(args):
 # prepare-shard: 一次性产出 task_envelope
 # ---------------------------------------------------------------------------
 
-def cmd_prepare_shard(args):
-    """为指定源文件生成 task_envelope.json，包含 sub-agent 所需的全部上下文。
+def _build_single_envelope(process, src_path, round_num, repo_root=".", blind=False):
+    """构建单个文件的 task_envelope 字典。
 
-    sub-agent 读取这一个文件就能开始工作，无需额外 Read。
+    Returns (envelope, info_str) 或 (None, error_msg)。
     """
-    process = _load_json(args.process)
-
-    if not process:
-        print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
-        sys.exit(1)
-
-    src_path = args.file
     proc_files = process.get("files", {})
     if src_path not in proc_files:
-        print(f"错误: {src_path} 不在调度状态中", file=sys.stderr)
-        sys.exit(1)
+        return None, f"{src_path} 不在调度状态中"
 
     cov_config, max_iter, shards_root = _resolve_common(process)
     info = proc_files[src_path]
     paths = _shard_paths(shards_root, src_path)
     slug = paths["slug"]
 
-    # 收集函数信息（排除 test_optional）
     functions = {}
     for func_key, fmeta in info.get("functions", {}).items():
         if fmeta.get("test_optional"):
@@ -1373,7 +1364,6 @@ def cmd_prepare_shard(args):
             "mocks_needed": fmeta.get("mocks_needed", []),
         }
 
-    # 读取 run_state shard（获取已有 cases）
     state_shard_path = Path(paths["state_shard"])
     existing_cases = {}
     if state_shard_path.is_file():
@@ -1388,7 +1378,6 @@ def cmd_prepare_shard(args):
                     for c in cases
                 ]
 
-    # 读取 run_result shard（获取覆盖率）
     run_result_path = Path(paths["run_result"])
     coverage = {}
     coverage_summary = {}
@@ -1397,25 +1386,21 @@ def cmd_prepare_shard(args):
         coverage = rr.get("coverage", {}).get(src_path, {})
         coverage_summary = rr.get("summary", {}).get("coverage", {})
 
-    # 读取 verdicts（如果存在）
     verdicts = []
     verdicts_path = Path(f"{shards_root.rstrip('/')}/verdicts/{slug}.json")
     if verdicts_path.is_file():
         vdata = json.loads(verdicts_path.read_text(encoding="utf-8"))
         verdicts = vdata.get("verdicts", [])
 
-    # 读取 next_action（如果存在）
     next_action_path = Path(f"{shards_root.rstrip('/')}/next_actions/{slug}.json")
     next_action = None
     if next_action_path.is_file():
         next_action = json.loads(next_action_path.read_text(encoding="utf-8"))
 
-    # O14: 预切 source_snippet（每个函数 ±20 行）
-    # 盲测模式：round 1 只给签名 + docstring
     source_snippets = {}
     oracle_quality_map = {}
-    repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(".")
-    src_file = repo_root / src_path
+    repo_root_path = Path(repo_root).resolve() if repo_root else Path(".")
+    src_file = repo_root_path / src_path
     src_lines = []
     if src_file.is_file():
         try:
@@ -1423,18 +1408,16 @@ def cmd_prepare_shard(args):
         except Exception:
             pass
 
-    use_blind = getattr(args, "blind", False) and args.round <= 1
+    use_blind = blind and round_num <= 1
 
     if src_lines:
-        # 先评估所有函数的 oracle_quality（盲测模式才需要）
         if use_blind:
             for func_key, fmeta in info.get("functions", {}).items():
                 if fmeta.get("test_optional"):
                     continue
                 lr = fmeta.get("line_range", [0, 0])
                 docstring = _extract_docstring(src_lines, lr[0])
-                oq = _assess_oracle_quality(docstring)
-                oracle_quality_map[func_key] = oq
+                oracle_quality_map[func_key] = _assess_oracle_quality(docstring)
 
         pad = 20
         for func_key, fmeta in info.get("functions", {}).items():
@@ -1443,9 +1426,8 @@ def cmd_prepare_shard(args):
             lr = fmeta.get("line_range", [0, 0])
             oq = oracle_quality_map.get(func_key)
 
-            # 盲测模式 + oracle_quality 为 high/medium → 只给签名+docstring
             if use_blind and oq in ("high", "medium"):
-                sig_line_idx = lr[0] - 1  # 1-indexed → 0-indexed
+                sig_line_idx = lr[0] - 1
                 if 0 <= sig_line_idx < len(src_lines):
                     sig_text = src_lines[sig_line_idx]
                     docstring = _extract_docstring(src_lines, lr[0])
@@ -1460,7 +1442,6 @@ def cmd_prepare_shard(args):
                         "mode": "blind" if oq == "high" else "narrowed",
                     }
             else:
-                # 正常模式 或 blind+low：±20 行完整实现
                 start = max(1, lr[0] - pad)
                 end = min(len(src_lines), lr[1] + pad)
                 source_snippets[func_key] = {
@@ -1473,13 +1454,12 @@ def cmd_prepare_shard(args):
                     "mode": "sighted",
                 }
 
-    # 构建 task_envelope
     envelope = {
         "shard_slug": slug,
         "source_path": src_path,
         "test_path": info.get("test_path", ""),
         "file_md5": info.get("file_md5", ""),
-        "round": args.round,
+        "round": round_num,
         "scope_sources": [src_path],
         "functions": functions,
         "existing_cases": existing_cases,
@@ -1498,21 +1478,69 @@ def cmd_prepare_shard(args):
         },
     }
 
-    # 写入输出
-    out_path = Path(args.output)
-    _write_json_atomic(envelope, out_path)
-
     n_funcs = len(functions)
     n_cases = sum(len(c) for c in existing_cases.values())
     blind_tag = " [盲测]" if use_blind else ""
-    print(
-        f"task_envelope: {out_path}\n"
-        f"  文件: {src_path}{blind_tag}\n"
-        f"  函数: {n_funcs}, 已有 case: {n_cases}\n"
-        f"  verdicts: {len(verdicts)}, next_action: {next_action.get('action') if next_action else '-'}",
-        file=sys.stderr,
-    )
+    info_str = (f"  文件: {src_path}{blind_tag}\n"
+                f"  函数: {n_funcs}, 已有 case: {n_cases}\n"
+                f"  verdicts: {len(verdicts)}, next_action: "
+                f"{next_action.get('action') if next_action else '-'}")
+    return envelope, info_str
 
+
+def cmd_prepare_shard(args):
+    """为指定文件生成 task_envelope.json。支持批量模式和单文件模式。"""
+    process = _load_json(args.process)
+    if not process:
+        print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
+        sys.exit(1)
+
+    if args.from_claim:
+        # 批量模式：从 claim batch 文件生成所有 envelope
+        claim_data = _load_json(args.from_claim)
+        if not claim_data:
+            print(f"错误: claim batch {args.from_claim} 不存在或为空", file=sys.stderr)
+            sys.exit(1)
+
+        generated = []
+        for file_info in claim_data.get("files", []):
+            src_path = file_info.get("source_path")
+            if not src_path:
+                continue
+            slug = file_info.get("paths", {}).get("slug", _slug(src_path))
+            round_num = process.get("files", {}).get(src_path, {}).get("claim_round", 1)
+
+            envelope, info_str = _build_single_envelope(
+                process, src_path, round_num, args.repo_root,
+                getattr(args, "blind", False),
+            )
+            if envelope is None:
+                print(f"警告: {info_str}", file=sys.stderr)
+                continue
+
+            out_path = Path(f".test/task_envelopes/{slug}.json")
+            _write_json_atomic(envelope, out_path)
+            generated.append({"source_path": src_path, "envelope_path": str(out_path)})
+            print(info_str, file=sys.stderr)
+
+        print(json.dumps({"generated": generated}, indent=2, ensure_ascii=False))
+    else:
+        # 单文件模式
+        if not args.file:
+            print("错误: 必须提供 --file 或 --from-claim 之一", file=sys.stderr)
+            sys.exit(1)
+
+        envelope, info_str = _build_single_envelope(
+            process, args.file, args.round, args.repo_root,
+            getattr(args, "blind", False),
+        )
+        if envelope is None:
+            print(f"错误: {info_str}", file=sys.stderr)
+            sys.exit(1)
+
+        out_path = Path(args.output)
+        _write_json_atomic(envelope, out_path)
+        print(f"task_envelope: {out_path}\n{info_str}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # verify-repro: 验证复现脚本（Phase 5）
@@ -1826,13 +1854,19 @@ def main():
     # prepare-shard
     p_ps = sub.add_parser("prepare-shard",
                           help="为指定文件生成 task_envelope.json")
-    p_ps.add_argument("--process", required=True, help="generate_process.json 路径")
-    p_ps.add_argument("--file", required=True, help="源文件路径")
-    p_ps.add_argument("--round", type=int, default=1, help="当前轮数")
+    p_ps.add_argument("--process", default="test/generated_unit/generate_process.json",
+                       help="generate_process.json 路径（默认 test/generated_unit/generate_process.json）")
+    p_ps.add_argument("--from-claim", default=None,
+                       help="claim batch 文件路径（批量模式，自动为所有文件生成 envelope）")
+    p_ps.add_argument("--file", default=None,
+                       help="源文件路径（单文件模式，需配合 --round 和 --output）")
+    p_ps.add_argument("--round", type=int, default=1, help="当前轮数（单文件模式使用，批量模式自动推导）")
     p_ps.add_argument("--repo-root", default=".", help="仓库根目录")
-    p_ps.add_argument("--output", required=True, help="task_envelope.json 输出路径")
+    p_ps.add_argument("--output", default=None,
+                       help="task_envelope.json 输出路径（单文件模式使用，批量模式自动推导）")
     p_ps.add_argument("--blind", action="store_true", default=False,
                        help="盲测模式：round 1 的 source_snippets 只含签名+docstring")
+
 
     # verify-repro（Phase 5）
     p_vr = sub.add_parser("verify-repro",
