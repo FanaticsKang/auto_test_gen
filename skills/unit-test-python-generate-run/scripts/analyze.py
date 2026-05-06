@@ -624,19 +624,37 @@ def cmd_apply_and_run(args):
     Sub-agent 每轮只需调用这一个命令，替换原来的 3 个 tool call。
     输出结构化 JSON，包含 runner 结果和 run_state 摘要。
     """
-    baseline_path = Path(args.baseline)
+    # ---- 从 task_envelope 推导参数（显式传入时跳过） ----
+    if getattr(args, "task_envelope", None) and args.task_envelope:
+        env = json.loads(Path(args.task_envelope).read_text(encoding="utf-8"))
+        if not args.run_state:
+            args.run_state = env["paths"]["state_shard"]
+        if not args.run_result:
+            args.run_result = env["paths"]["run_result"]
+        if not args.scope_sources:
+            args.scope_sources = env["source_path"]
+        if not args.test_file:
+            args.test_file = env["test_path"]
+
+    # ---- 从 generate_process 替代 baseline ----
+    gp_path = Path(args.generate_process) if getattr(args, "generate_process", None) else None
+    if gp_path and gp_path.is_file():
+        baseline = json.loads(gp_path.read_text(encoding="utf-8"))
+        baseline_path = gp_path
+    elif args.baseline:
+        baseline_path = Path(args.baseline)
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    else:
+        print("错误: 需要 --generate-process 或 --baseline", file=sys.stderr)
+        sys.exit(1)
+
     run_state_path = Path(args.run_state)
     patch_path = Path(args.cases_patch) if args.cases_patch else None
 
-    if not baseline_path.is_file():
-        print(f"错误: 基线 {baseline_path} 不存在", file=sys.stderr)
-        sys.exit(1)
     if (patch_path is None or not patch_path.is_file()) \
        and not getattr(args, "cases_patch_dir", None):
         print("错误: 必须提供 --cases-patch 或 --cases-patch-dir", file=sys.stderr)
         sys.exit(1)
-
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
 
     # Step 1: update-state (apply patch)
     if run_state_path.is_file():
@@ -815,8 +833,31 @@ def cmd_decide_next(args):
     """根据当前状态决定 next_action。"""
     from analyze_rules.decide_policy import decide_next_action
 
+    # ---- 从 task_envelope 推导参数 ----
+    if getattr(args, "task_envelope", None) and args.task_envelope:
+        env = json.loads(Path(args.task_envelope).read_text(encoding="utf-8"))
+        if not args.run_state:
+            args.run_state = env["paths"]["state_shard"]
+        if not args.run_result:
+            args.run_result = env["paths"]["run_result"]
+        if not args.max_iterations:
+            args.max_iterations = env.get("budgets", {}).get("max_iterations", 5)
+
+    # ---- 从 generate_process 替代 baseline ----
+    gp_path = Path(args.generate_process) if getattr(args, "generate_process", None) else None
+    if gp_path and gp_path.is_file():
+        baseline = json.loads(gp_path.read_text(encoding="utf-8"))
+    elif args.baseline:
+        baseline = _load_json(args.baseline)
+    else:
+        print("错误: 需要 --generate-process 或 --baseline", file=sys.stderr)
+        sys.exit(1)
+
+    # max-iterations 回退默认值
+    if not args.max_iterations:
+        args.max_iterations = 5
+
     run_state = _load_json(args.run_state)
-    baseline = _load_json(args.baseline)
     run_result = _load_json(args.run_result) if args.run_result else {}
 
     if not run_state:
@@ -1041,14 +1082,20 @@ def main():
     # apply-and-run
     p_aar = sub.add_parser("apply-and-run",
                             help="Chained: update-state → runner run → update-state sync")
-    p_aar.add_argument("--baseline", required=True, help="test_cases.json（只读）")
-    p_aar.add_argument("--run-state", required=True, help="test_run_state.json / shard")
+    # 简化入口：task-envelope + generate-process 自动推导其余参数
+    p_aar.add_argument("--task-envelope", default=None,
+                        help="task_envelope JSON 路径，自动推导 --run-state/--run-result/--test-file/--scope-sources")
+    p_aar.add_argument("--generate-process", default="test/generated_unit/generate_process.json",
+                        help="generate_process.json 路径（替代 --baseline，默认 test/generated_unit/generate_process.json）")
+    # 以下参数均可从 task-envelope/generate-process 推导，显式传入时覆盖
+    p_aar.add_argument("--baseline", default=None, help="test_cases.json（只读，已被 --generate-process 替代）")
+    p_aar.add_argument("--run-state", default=None, help="test_run_state.json / shard")
     p_aar.add_argument("--cases-patch", default=None, help="LLM 生成的 cases patch")
     p_aar.add_argument("--round", type=int, required=True, help="轮数")
     p_aar.add_argument("--runner-path", default=None,
                         help="runner.py 路径（默认与 analyze.py 同目录）")
-    p_aar.add_argument("--test-file", required=True, help="测试文件路径")
-    p_aar.add_argument("--run-result", required=True, help="run_result 输出路径")
+    p_aar.add_argument("--test-file", default=None, help="测试文件路径")
+    p_aar.add_argument("--run-result", default=None, help="run_result 输出路径")
     p_aar.add_argument("--repo-root", default=".", help="仓库根目录")
     p_aar.add_argument("--source-dirs", default=None, help="覆盖率源目录（逗号分隔）")
     p_aar.add_argument("--scope-sources", default=None,
@@ -1077,12 +1124,16 @@ def main():
 
     # decide-next
     p_dn = sub.add_parser("decide-next", help="决定下一步行动")
-    p_dn.add_argument("--baseline", required=True, help="test_cases.json（只读）")
-    p_dn.add_argument("--run-state", required=True, help="test_run_state.json")
+    p_dn.add_argument("--task-envelope", default=None,
+                        help="task_envelope JSON 路径，自动推导 --run-state/--run-result/--max-iterations 等")
+    p_dn.add_argument("--generate-process", default="test/generated_unit/generate_process.json",
+                        help="generate_process.json 路径（替代 --baseline）")
+    p_dn.add_argument("--baseline", default=None, help="test_cases.json（只读，已被 --generate-process 替代）")
+    p_dn.add_argument("--run-state", default=None, help="test_run_state.json")
     p_dn.add_argument("--run-result", default=None, help="可选；run_result.json")
     p_dn.add_argument("--verdicts", default=None, help="可选；classify-failures 输出")
     p_dn.add_argument("--round", type=int, required=True, help="当前轮数")
-    p_dn.add_argument("--max-iterations", type=int, default=5, help="最大迭代数")
+    p_dn.add_argument("--max-iterations", type=int, default=None, help="最大迭代数")
     p_dn.add_argument("--output", required=True, help="next_action.json 输出路径")
     p_dn.add_argument("--statement-threshold", type=int, default=None,
                       help="覆盖 baseline 中的语句覆盖率阈值")

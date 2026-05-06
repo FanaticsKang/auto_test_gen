@@ -175,15 +175,23 @@ cases-patch 格式：
 
 ```bash
 python {sd}/analyze.py apply-and-run \
-  --baseline test/generated_unit/test_cases.json \
-  --run-state {paths.state_shard} \
+  --task-envelope .test/task_envelopes/{shard_slug}.json \
+  --cases-patch .test/cases_patch/{shard_slug}_iter{N}.json \
+  --round {N}
+```
+
+`--task-envelope` 自动推导 `--run-state`、`--run-result`、`--test-file`、`--scope-sources`。`--generate-process` 默认读取 `test/generated_unit/generate_process.json` 替代 `--baseline`。
+
+完整参数写法（需要覆盖默认值时使用）：
+
+```bash
+python {sd}/analyze.py apply-and-run \
+  --task-envelope .test/task_envelopes/{shard_slug}.json \
   --cases-patch .test/cases_patch/{shard_slug}_iter{N}.json \
   --round {N} \
-  --test-file {test_path} \
+  --generate-process test/generated_unit/generate_process.json \
   --run-result {paths.run_result} \
-  --repo-root . \
-  --source-dirs . \
-  --scope-sources {source_path}
+  --repo-root .
 ```
 
 `apply-and-run` 内部自动执行：update-state → {sd}/runner.py run → update-state sync。
@@ -260,16 +268,13 @@ python {sd}/analyze.py record-bug \
 
 ```bash
 python {sd}/analyze.py decide-next \
-  --baseline test/generated_unit/test_cases.json \
-  --run-state {paths.state_shard} \
-  --run-result {paths.run_result} \
+  --task-envelope .test/task_envelopes/{shard_slug}.json \
   --verdicts .test/verdicts/{shard_slug}.json \
-  --round {N} --max-iterations {max_iterations} \
-  --statement-threshold {coverage_config.statement_threshold} \
-  --branch-threshold {coverage_config.branch_threshold} \
-  --function-threshold {coverage_config.function_threshold} \
+  --round {N} \
   --output .test/next_actions/{shard_slug}.json
 ```
+
+`--task-envelope` 自动推导 `--run-state`、`--run-result`、`--max-iterations`。`--generate-process` 默认读取 `test/generated_unit/generate_process.json` 替代 `--baseline`，覆盖率阈值也从该文件的 `coverage_config` 自动获取。
 
 读取输出，按 `action` + `fix_kind` 字段决定：
 
