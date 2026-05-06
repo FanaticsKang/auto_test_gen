@@ -420,9 +420,9 @@ def cmd_gaps(args):
         sys.exit(1)
 
     cov_config = baseline.get("coverage_config", {})
-    stmt_thr = cov_config.get("statement_threshold", 90)
-    branch_thr = cov_config.get("branch_threshold", 90)
-    func_thr = cov_config.get("function_threshold", 100)
+    stmt_thr = getattr(args, "statement_threshold", None) or cov_config.get("statement_threshold", 90)
+    branch_thr = getattr(args, "branch_threshold", None) or cov_config.get("branch_threshold", 90)
+    func_thr = getattr(args, "function_threshold", None) or cov_config.get("function_threshold", 100)
     exclude_dirs = cov_config.get("exclude_dirs", [])
 
     run_cov = run_result.get("coverage", {})
@@ -824,9 +824,9 @@ def cmd_decide_next(args):
         sys.exit(1)
 
     cov_config = baseline.get("coverage_config", {})
-    stmt_thr = cov_config.get("statement_threshold", 90)
-    branch_thr = cov_config.get("branch_threshold", 90)
-    func_thr = cov_config.get("function_threshold", 100)
+    stmt_thr = getattr(args, "statement_threshold", None) or cov_config.get("statement_threshold", 90)
+    branch_thr = getattr(args, "branch_threshold", None) or cov_config.get("branch_threshold", 90)
+    func_thr = getattr(args, "function_threshold", None) or cov_config.get("function_threshold", 100)
 
     cov_summary = run_result.get("summary", {}).get("coverage", {})
     stmt_rate = cov_summary.get("statement_rate", 0)
@@ -1016,6 +1016,12 @@ def main():
     p_gaps.add_argument("--baseline", required=True, help="基线（只读）")
     p_gaps.add_argument("--run-state", required=True, help="运行状态（只读）")
     p_gaps.add_argument("--output", required=True)
+    p_gaps.add_argument("--statement-threshold", type=int, default=None,
+                        help="覆盖 baseline 中的语句覆盖率阈值")
+    p_gaps.add_argument("--branch-threshold", type=int, default=None,
+                        help="覆盖 baseline 中的分支覆盖率阈值")
+    p_gaps.add_argument("--function-threshold", type=int, default=None,
+                        help="覆盖 baseline 中的函数覆盖率阈值")
 
     # record-bug
     p_rb = sub.add_parser("record-bug", help="追加源代码疑似 bug")
@@ -1078,6 +1084,12 @@ def main():
     p_dn.add_argument("--round", type=int, required=True, help="当前轮数")
     p_dn.add_argument("--max-iterations", type=int, default=5, help="最大迭代数")
     p_dn.add_argument("--output", required=True, help="next_action.json 输出路径")
+    p_dn.add_argument("--statement-threshold", type=int, default=None,
+                      help="覆盖 baseline 中的语句覆盖率阈值")
+    p_dn.add_argument("--branch-threshold", type=int, default=None,
+                      help="覆盖 baseline 中的分支覆盖率阈值")
+    p_dn.add_argument("--function-threshold", type=int, default=None,
+                      help="覆盖 baseline 中的函数覆盖率阈值")
 
     # scaffold-cases
     p_sc = sub.add_parser("scaffold-cases", help="按 gap 生成占位 case")

@@ -250,6 +250,9 @@ python {sd}/analyze.py decide-next \
   --run-result {paths.run_result} \
   --verdicts .test/verdicts/{shard_slug}.json \
   --round {N} --max-iterations {max_iterations} \
+  --statement-threshold {coverage_config.statement_threshold} \
+  --branch-threshold {coverage_config.branch_threshold} \
+  --function-threshold {coverage_config.function_threshold} \
   --output .test/next_actions/{shard_slug}.json
 ```
 
@@ -285,6 +288,9 @@ python {sd}/analyze.py gaps \
   --run-result {paths.run_result} \
   --baseline test/generated_unit/test_cases.json \
   --run-state {paths.state_shard} \
+  --statement-threshold {coverage_config.statement_threshold} \
+  --branch-threshold {coverage_config.branch_threshold} \
+  --function-threshold {coverage_config.function_threshold} \
   --output .test/gaps/{shard_slug}_iter{N}.json
 ```
 
@@ -337,8 +343,8 @@ python {sd}/dispatch.py verify-repro \
     "parse_header": {
       "dimensions": ["functional", "boundary", "exception"],
       "coverage": {
-        "line": {"target": 90, "actual": 95.5},
-        "branch": {"target": 90, "actual": 88.0},
+        "statement": {"target": 90, "actual": 95.5},
+        "branch": {"target": 80, "actual": 88.0},
         "function": {"target": 100, "actual": 100}
       }
     }

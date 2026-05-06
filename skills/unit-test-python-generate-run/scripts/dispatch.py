@@ -175,7 +175,14 @@ def cmd_init(args):
         print(f"错误: 基线 {args.baseline} 不存在或为空", file=sys.stderr)
         sys.exit(1)
 
-    cov_config = baseline.get("coverage_config", {})
+    cov_config = dict(baseline.get("coverage_config", {}))
+    # CLI 参数覆盖 baseline 中的阈值
+    if args.statement_threshold is not None:
+        cov_config["statement_threshold"] = args.statement_threshold
+    if args.branch_threshold is not None:
+        cov_config["branch_threshold"] = args.branch_threshold
+    if args.function_threshold is not None:
+        cov_config["function_threshold"] = args.function_threshold
 
     files = {}
     for src_path, finfo in baseline.get("files", {}).items():
@@ -1759,6 +1766,12 @@ def main():
                         help="子 agent 最大内部迭代次数（默认 5）")
     p_init.add_argument("--shards-root", default=".test",
                         help="per-file shards 的根目录（默认 .test）")
+    p_init.add_argument("--statement-threshold", type=int, default=None,
+                        help="覆盖 baseline 中的语句覆盖率阈值")
+    p_init.add_argument("--branch-threshold", type=int, default=None,
+                        help="覆盖 baseline 中的分支覆盖率阈值")
+    p_init.add_argument("--function-threshold", type=int, default=None,
+                        help="覆盖 baseline 中的函数覆盖率阈值")
 
     # batch
     p_batch = sub.add_parser("batch", help="只读查询 n 个待处理文件")
