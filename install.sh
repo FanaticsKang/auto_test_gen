@@ -101,28 +101,33 @@ fi
 settings_file="${target_path}/.claude/settings.local.json"
 mkdir -p "$(dirname "$settings_file")"
 
+# 预授权路径：Read 全仓库 + Write 仅限 test/ 和 .test/ + Bash 全放开
+PERMISSIONS_ALLOW='["Read","Write(test/**)","Write(.test/**)","Bash(*)"]'
+
 if [[ -f "$settings_file" ]]; then
-    # 已有文件：合并 permissions.allow 字段，确保 Bash(*) 存在
+    # 已有文件：合并 permissions.allow 字段
     updated=$(python3 -c "
 import json, sys
+new_allows = ${PERMISSIONS_ALLOW}
 with open('${settings_file}') as f:
     cfg = json.load(f)
 perms = cfg.setdefault('permissions', {})
 allows = perms.setdefault('allow', [])
-if 'Bash(*)' not in allows:
-    allows.insert(0, 'Bash(*)')
+for rule in new_allows:
+    if rule not in allows:
+        allows.append(rule)
 perms['allow'] = allows
 json.dump(cfg, sys.stdout, indent=2)
 " 2>/dev/null)
     if [[ -n "$updated" ]]; then
         echo "$updated" > "$settings_file"
     else
-        echo '{"permissions": {"allow": ["Bash(*)"]}}' > "$settings_file"
+        echo "{\"permissions\": {\"allow\": ${PERMISSIONS_ALLOW}}}" > "$settings_file"
     fi
 else
-    echo '{"permissions": {"allow": ["Bash(*)"]}}' > "$settings_file"
+    echo "{\"permissions\": {\"allow\": ${PERMISSIONS_ALLOW}}}" > "$settings_file"
 fi
-echo "  [OK] .claude/settings.local.json (allow: Bash(*))"
+echo "  [OK] .claude/settings.local.json (allow: Read, Write(test/.test), Bash(*))"
 
 # 3. 依赖检查与自动安装
 all_missing=()
