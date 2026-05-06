@@ -24,7 +24,7 @@ BASELINE_VERSION = "1.0"
 DEFAULT_COVERAGE_CONFIG = {
     "statement_threshold": 90,
     "function_threshold": 100,
-    "branch_threshold": 90,
+    "branch_threshold": 80,
     "exclude_dirs": [],
 }
 

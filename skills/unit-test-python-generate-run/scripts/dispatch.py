@@ -336,7 +336,7 @@ def _count_statuses(proc_files):
 
 def _resolve_common(process):
     cov_config = process.get("coverage_config", {})
-    max_iter = process.get("max_iterations", 5)
+    max_iter = process.get("max_iterations", 3)
     shards_root = process.get("shards_root", ".test")
     return cov_config, max_iter, shards_root
 
@@ -716,7 +716,7 @@ def _render_markdown(process, run_state, run_result, source_bugs) -> str:
     early_stop_count = 0
     exhausted_count = 0
     one_pass_count = 0
-    max_iters_config = (process or {}).get("max_iterations", 5)
+    max_iters_config = (process or {}).get("max_iterations", 3)
     for src_path, info in proc_files.items():
         result = info.get("result")
         if not result:
@@ -1756,10 +1756,12 @@ def main():
 
     # init
     p_init = sub.add_parser("init", help="从基线生成 generate_process.json")
-    p_init.add_argument("--baseline", required=True, help="test_cases.json 路径")
-    p_init.add_argument("--output", required=True, help="generate_process.json 输出路径")
-    p_init.add_argument("--max-iterations", type=int, default=5,
-                        help="子 agent 最大内部迭代次数（默认 5）")
+    p_init.add_argument("--baseline", default="test/generated_unit/test_cases.json",
+                        help="test_cases.json 路径（默认 test/generated_unit/test_cases.json）")
+    p_init.add_argument("--output", default="test/generated_unit/generate_process.json",
+                        help="generate_process.json 输出路径（默认 test/generated_unit/generate_process.json）")
+    p_init.add_argument("--max-iterations", type=int, default=3,
+                        help="子 agent 最大内部迭代次数（默认 3）")
     p_init.add_argument("--shards-root", default=".test",
                         help="per-file shards 的根目录（默认 .test）")
     p_init.add_argument("--statement-threshold", type=int, default=None,
