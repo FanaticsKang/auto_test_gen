@@ -518,7 +518,7 @@ def cmd_claim(args):
         for p in claim_paths
     ]
 
-    print(json.dumps({
+    result = {
         "batch_size": len(batch),
         "claimed_at": now_iso,
         "reclaimed_stale": reclaimed,
@@ -529,7 +529,15 @@ def cmd_claim(args):
         "circuit_break_reason": circuit_reason,
         "files": batch,
         **overall,
-    }, indent=2, ensure_ascii=False))
+    }
+
+    # 落盘到 .test/claim_batch/
+    claim_dir = Path(args.claim_dir)
+    claim_dir.mkdir(parents=True, exist_ok=True)
+    ts_filename = now_iso.replace(":", "-") + ".json"
+    _write_json_atomic(result, claim_dir / ts_filename)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -1790,6 +1798,8 @@ def main():
                          help="AIMD 允许的最大并发度（默认等于 --number）")
     p_claim.add_argument("--stale-seconds", type=int, default=600,
                          help="\"running\"超过该秒数自动回收（默认 600=10 分钟）")
+    p_claim.add_argument("--claim-dir", default=".test/claim_batch",
+                         help="claim 输出落盘目录（默认 .test/claim_batch）")
 
     # report
     p_report = sub.add_parser("report", help="按文件输出测试分析报告")
