@@ -1782,8 +1782,10 @@ def main():
     # claim
     p_claim = sub.add_parser("claim",
                               help="原子选 N 个，标记为\"执行中\"；返回结构同 batch")
-    p_claim.add_argument("--process", required=True)
-    p_claim.add_argument("--number", type=int, required=True)
+    p_claim.add_argument("--process", default="test/generated_unit/generate_process.json",
+                         help="generate_process.json 路径（默认 test/generated_unit/generate_process.json）")
+    p_claim.add_argument("--number", type=int, default=3,
+                         help="本轮 claim 的文件数量（默认 3）")
     p_claim.add_argument("--max-number", type=int, default=None,
                          help="AIMD 允许的最大并发度（默认等于 --number）")
     p_claim.add_argument("--stale-seconds", type=int, default=600,
