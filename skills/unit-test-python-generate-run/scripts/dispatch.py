@@ -336,7 +336,7 @@ def _count_statuses(proc_files):
 
 def _resolve_common(process):
     cov_config = process.get("coverage_config", {})
-    max_iter = process.get("max_iterations", 3)
+    max_iter = process.get("max_iterations", 5)
     shards_root = process.get("shards_root", ".test")
     return cov_config, max_iter, shards_root
 
@@ -1796,8 +1796,8 @@ def main():
                         help="test_cases.json 路径（默认 test/generated_unit/test_cases.json）")
     p_init.add_argument("--output", default="test/generated_unit/generate_process.json",
                         help="generate_process.json 输出路径（默认 test/generated_unit/generate_process.json）")
-    p_init.add_argument("--max-iterations", type=int, default=3,
-                        help="子 agent 最大内部迭代次数（默认 3）")
+    p_init.add_argument("--max-iterations", type=int, default=5,
+                        help="子 agent 最大内部迭代次数（默认 5）")
     p_init.add_argument("--shards-root", default=".test",
                         help="per-file shards 的根目录（默认 .test）")
     p_init.add_argument("--statement-threshold", type=int, default=None,
