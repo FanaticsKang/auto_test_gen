@@ -8,6 +8,8 @@ dispatch.py — 单测生成流水线的调度编排脚本。
   claim             原子选 N 个文件并标 "running"（含 claimed_at），返回与 batch 同构的信息
   prepare-shard     为指定源文件生成 task_envelope.json
   verify-artifacts  验证 sub-agent 三个产物文件是否齐全
+  merge-state       合并 per-file state shards → 统一 run_state
+  merge-bugs        合并 per-file bug shards → 统一 source_bugs
   report            按源文件输出测试分析报告（Markdown / JSON）
 
 claim 对比 batch：batch 只查不写、适合 dry-run；claim 原子写回状态、适合并行派发。
@@ -1563,6 +1565,188 @@ def cmd_verify_repro(args):
     )
 
 
+# ---------------------------------------------------------------------------
+# merge-state: 合并 per-file state shards → 统一 run_state
+# ---------------------------------------------------------------------------
+
+RUN_STATE_VERSION = "1.0"
+
+
+def _init_run_state(baseline: dict, baseline_path) -> dict:
+    files = {}
+    for src_path, finfo in baseline.get("files", {}).items():
+        func_entries = {}
+        for func_key, fmeta in finfo.get("functions", {}).items():
+            func_entries[func_key] = {
+                "func_md5_at_gen": fmeta.get("func_md5", ""),
+                "cases": [],
+            }
+        files[src_path] = {
+            "file_md5_at_gen": finfo.get("file_md5", ""),
+            "test_path": finfo.get("test_path", ""),
+            "functions": func_entries,
+        }
+
+    return {
+        "version": RUN_STATE_VERSION,
+        "baseline_ref": str(baseline_path),
+        "baseline_version": baseline.get("version", ""),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "last_round": 0,
+        "summary": {
+            "total_cases": 0,
+            "passed": 0,
+            "failed": 0,
+            "source_bugs": 0,
+            "coverage": {
+                "statement_rate": 0.0,
+                "branch_rate": 0.0,
+                "function_rate": 0.0,
+            },
+        },
+        "rounds": [],
+        "files": files,
+    }
+
+
+def cmd_merge_state(args):
+    baseline_path = Path(args.baseline)
+    baseline = _load_json(baseline_path)
+    if not baseline:
+        print(f"错误: 基线 {args.baseline} 为空或不存在", file=sys.stderr)
+        sys.exit(1)
+
+    merged = _init_run_state(baseline, baseline_path)
+    merged_files = merged["files"]
+
+    shards_dir = Path(args.shards_dir)
+    if not shards_dir.is_dir():
+        print(f"警告: shards dir {shards_dir} 不存在，合并出空 run_state",
+              file=sys.stderr)
+        shard_paths = []
+    else:
+        shard_paths = sorted(shards_dir.glob("*.json"))
+
+    max_round = 0
+    for shard_path in shard_paths:
+        try:
+            shard = json.loads(shard_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"警告: shard {shard_path} 无法解析: {e}", file=sys.stderr)
+            continue
+
+        max_round = max(max_round, shard.get("last_round", 0))
+
+        for src, file_data in shard.get("files", {}).items():
+            if src not in merged_files:
+                merged_files[src] = {
+                    "file_md5_at_gen": file_data.get("file_md5_at_gen", ""),
+                    "test_path": file_data.get("test_path", ""),
+                    "functions": {},
+                }
+
+            if "test_path" in file_data:
+                merged_files[src]["test_path"] = file_data["test_path"]
+
+            for func_key, func_data in file_data.get("functions", {}).items():
+                cases = func_data.get("cases", [])
+                if not cases:
+                    merged_files[src]["functions"].setdefault(func_key, func_data)
+                    continue
+                merged_files[src]["functions"][func_key] = {
+                    "func_md5_at_gen": func_data.get("func_md5_at_gen", ""),
+                    "cases": cases,
+                }
+
+    total_cases = 0
+    passed = failed = source_bugs = 0
+    for fi in merged_files.values():
+        for f in fi.get("functions", {}).values():
+            for c in f.get("cases", []):
+                total_cases += 1
+                st = c.get("status")
+                if st == "passed":
+                    passed += 1
+                elif st in ("failed", "failed_persistent"):
+                    failed += 1
+                elif st in ("source_bug",):
+                    source_bugs += 1
+
+    merged["summary"]["total_cases"] = total_cases
+    merged["summary"]["passed"] = passed
+    merged["summary"]["failed"] = failed
+    merged["summary"]["source_bugs"] = source_bugs
+    merged["last_round"] = max_round
+    merged["generated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    _write_json_atomic(merged, Path(args.output))
+    print(
+        f"已合并 {len(shard_paths)} 个 state shards → {args.output}\n"
+        f"  total_cases: {total_cases} (passed={passed}, failed={failed}, "
+        f"source_bugs={source_bugs})\n"
+        f"  last_round: {max_round}",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# merge-bugs: 合并 per-file bug shards → 统一 source_bugs
+# ---------------------------------------------------------------------------
+
+def cmd_merge_bugs(args):
+    shards_dir = Path(args.shards_dir)
+    merged = {
+        "version": "1.0",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "bugs": [],
+    }
+
+    by_fp = {}
+    order = []
+    shard_paths = sorted(shards_dir.glob("*.json")) if shards_dir.is_dir() else []
+
+    for shard_path in shard_paths:
+        try:
+            shard = json.loads(shard_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"警告: shard {shard_path} 无法解析: {e}", file=sys.stderr)
+            continue
+
+        for b in shard.get("bugs", []):
+            if b.get("function") == "NONE" and b.get("case_id") == "NONE":
+                continue
+            fp = b.get("fingerprint") or \
+                f"{b.get('file')}::{b.get('function')}::{b.get('case_id')}"
+            if fp in by_fp:
+                existing = by_fp[fp]
+                existing["occurrence_count"] = (
+                    existing.get("occurrence_count", 1)
+                    + b.get("occurrence_count", 1)
+                )
+                lsr = b.get("last_seen_round", 0)
+                if lsr > existing.get("last_seen_round", 0):
+                    existing["last_seen_round"] = lsr
+                    existing["last_seen_at"] = b.get(
+                        "last_seen_at", existing.get("last_seen_at")
+                    )
+            else:
+                by_fp[fp] = dict(b)
+                by_fp[fp].setdefault("review", {
+                    "status": "pending",
+                    "reviewer": None,
+                    "result": None,
+                })
+                order.append(fp)
+
+    merged["bugs"] = [by_fp[fp] for fp in order]
+    _write_json_atomic(merged, Path(args.output))
+    print(
+        f"已合并 {len(shard_paths)} 个 bug shards → {args.output}；共 "
+        f"{len(merged['bugs'])} 条",
+        file=sys.stderr,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="单测生成调度编排")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1640,6 +1824,21 @@ def main():
     p_vr.add_argument("--output", required=True,
                       help="验证结果输出路径")
 
+    # merge-state
+    p_ms = sub.add_parser("merge-state",
+                           help="合并 per-file state shards → 统一 run_state")
+    p_ms.add_argument("--shards-dir", required=True,
+                       help="存放 state shards 的目录（例如 .test/state_shards）")
+    p_ms.add_argument("--baseline", required=True, help="test_cases.json 路径")
+    p_ms.add_argument("--output", required=True, help="统一 run_state 输出路径")
+
+    # merge-bugs
+    p_mb = sub.add_parser("merge-bugs",
+                           help="合并 per-file bug shards → 统一 source_bugs")
+    p_mb.add_argument("--shards-dir", required=True,
+                       help="存放 bug shards 的目录（例如 .test/bug_shards）")
+    p_mb.add_argument("--output", required=True, help="统一 source_bugs 输出路径")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1656,6 +1855,10 @@ def main():
         cmd_prepare_shard(args)
     elif args.command == "verify-repro":
         cmd_verify_repro(args)
+    elif args.command == "merge-state":
+        cmd_merge_state(args)
+    elif args.command == "merge-bugs":
+        cmd_merge_bugs(args)
 
 
 if __name__ == "__main__":

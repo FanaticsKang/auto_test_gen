@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
 """
-analyze.py — 单测生成流水线的分析处理脚本。
+analyze.py — 单测生成流水线的分析处理脚本（子 agent 专用）。
 
 子命令：
   update-state       合并 cases patch 到 test_run_state.json / 或 per-file shard
-  extract-failures   打包失败上下文供 LLM 分类
-  gaps               筛出需要补测的函数
-  record-bug         追加源代码疑似 bug 到报告文件 / 或 per-file shard
-  merge-state        合并 per-file state shards → 统一 test_run_state.json
-  merge-bugs         合并 per-file bug shards → 统一 source_bugs.json
   apply-and-run      Chained: update-state → runner.py run → update-state sync
   classify-failures  硬编码失败分类 → verdicts.json
   decide-next        阈值 + fix_attempts 决定 next_action
   scaffold-cases     按 signature/dimensions 推占位 case
   lint-cases         校验 case 质量（必填字段/维度合法/去重）
+  gaps               筛出需要补测的函数
+  record-bug         追加源代码疑似 bug 到报告文件 / 或 per-file shard
 
 基线 (test_cases.json) 全程只读。
 
 并行场景下，每个 sub-agent 给 update-state / record-bug 传入自己的 shard 路径
-（例如 .test/state_shards/<slug>.json），主 agent 事后调用 merge-state /
+（例如 .test/state_shards/<slug>.json），主 agent 事后调用 dispatch.py merge-state /
 merge-bugs 把它们合并到最终单文件，避免并发写冲突。
 
 用法：
   python analyze.py update-state --baseline ... --run-state ... --cases-patch ... --round 1
-  python analyze.py extract-failures --run-result ... --baseline ... --run-state ... --output ...
   python analyze.py gaps --run-result ... --baseline ... --run-state ... --output ...
   python analyze.py record-bug --bugs-file ... --file ... --function ... --case-id ... --round 1 --traceback-file ... --reason "..."
-  python analyze.py merge-state --shards-dir .test/state_shards --baseline ... --output test/generated_unit/test_run_state.json
-  python analyze.py merge-bugs  --shards-dir .test/bug_shards  --output .test/source_bugs.json
 """
 
 import argparse
 import hashlib
 import json
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -414,162 +407,6 @@ def cmd_update_state(args):
 
 
 # ---------------------------------------------------------------------------
-# extract-failures: 打包失败上下文
-# ---------------------------------------------------------------------------
-
-def _read_lines(path: Path) -> list:
-    if not path.is_file():
-        return []
-    return path.read_text(encoding="utf-8", errors="replace").splitlines()
-
-
-def _slice(lines: list, start: int, end: int, pad: int = 2) -> dict:
-    n = len(lines)
-    s = max(1, start - pad)
-    e = min(n, end + pad)
-    return {
-        "start_line": s,
-        "end_line": e,
-        "text": "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(s, e + 1)),
-    }
-
-
-def _find_test_snippet(test_file: Path, test_name: str):
-    if not test_file.is_file() or not test_name:
-        return None
-    lines = _read_lines(test_file)
-    last_dot = test_name.split(".")[-1]
-    py_pat = re.compile(rf"\s*def\s+{re.escape(test_name)}\s*\(")
-
-    for i, ln in enumerate(lines, start=1):
-        if py_pat.match(ln):
-            indent = len(ln) - len(ln.lstrip())
-            end = i
-            for j in range(i + 1, len(lines) + 1):
-                nxt = lines[j - 1]
-                if not nxt.strip():
-                    continue
-                nxt_indent = len(nxt) - len(nxt.lstrip())
-                if (nxt_indent <= indent and nxt.strip()
-                        and not nxt.strip().startswith(("#", "@"))):
-                    break
-                end = j
-            return _slice(lines, i, end, pad=0)
-    return None
-
-
-def _find_case_in_run_state(run_state: dict, case_id: str):
-    for src_path, finfo in run_state.get("files", {}).items():
-        for func_key, fmeta in finfo.get("functions", {}).items():
-            for c in fmeta.get("cases", []):
-                if c.get("id") == case_id:
-                    return src_path, func_key, c
-    return None
-
-
-def _find_source_by_test_file(baseline: dict, test_file_rel: str):
-    for src_path, finfo in baseline.get("files", {}).items():
-        if finfo.get("test_path") == test_file_rel:
-            return src_path, finfo
-    return None
-
-
-def cmd_extract_failures(args):
-    run_result = _load_json(args.run_result)
-    baseline = _load_json(args.baseline)
-    run_state = _load_json(args.run_state)
-
-    if not run_result or not baseline or not run_state:
-        print("错误: 缺少必要的输入文件", file=sys.stderr)
-        sys.exit(1)
-
-    repo_root = Path(args.repo_root).resolve()
-
-    failures = []
-    for test in run_result.get("tests", []):
-        if test.get("status") not in ("failed", "error"):
-            continue
-
-        entry = {
-            "test_name": test.get("name"),
-            "test_file": test.get("test_file"),
-            "case_id": test.get("case_id"),
-            "status": test.get("status"),
-            "failure_type": test.get("failure_type"),
-            "traceback": test.get("traceback") or "",
-            "test_snippet": None,
-            "source_file": None,
-            "source_function": None,
-            "source_snippet": None,
-            "dimensions": None,
-            "mocks_needed": None,
-            "signature": None,
-            "case_description": None,
-            "prior_fix_attempts": 0,
-            "prior_failure_reason": None,
-        }
-
-        if test.get("test_file"):
-            tfile = repo_root / test["test_file"]
-            if tfile.is_file():
-                entry["test_snippet"] = _find_test_snippet(tfile, test.get("name") or "")
-
-        src_path = func_key = None
-        case_dict = None
-        if test.get("case_id"):
-            found = _find_case_in_run_state(run_state, test["case_id"])
-            if found:
-                src_path, func_key, case_dict = found
-
-        if src_path and func_key:
-            bl_func = (
-                baseline.get("files", {}).get(src_path, {})
-                .get("functions", {}).get(func_key)
-            )
-            if bl_func:
-                entry["source_file"] = src_path
-                entry["source_function"] = func_key
-                entry["dimensions"] = bl_func.get("dimensions", [])
-                entry["mocks_needed"] = bl_func.get("mocks_needed", [])
-                entry["signature"] = bl_func.get("signature", "")
-
-                line_range = bl_func.get("line_range", [1, 1])
-                src_file = repo_root / src_path
-                lines = _read_lines(src_file)
-                if lines:
-                    entry["source_snippet"] = _slice(lines, line_range[0], line_range[1], pad=args.pad)
-
-                if case_dict:
-                    entry["case_description"] = case_dict
-                    entry["prior_fix_attempts"] = case_dict.get("fix_attempts", 0)
-                    entry["prior_failure_reason"] = case_dict.get("failure_reason")
-
-        if not entry["source_file"] and test.get("test_file"):
-            fallback = _find_source_by_test_file(baseline, test["test_file"])
-            if fallback:
-                sp, finfo = fallback
-                entry["source_file"] = sp
-                entry["source_functions_in_file"] = [
-                    {"key": k, "line_range": fm.get("line_range"),
-                     "signature": fm.get("signature")}
-                    for k, fm in finfo.get("functions", {}).items()
-                ]
-
-        failures.append(entry)
-
-    output = {
-        "generated_at": run_result.get("generated_at"),
-        "total_failures": len(failures),
-        "run_return_code": run_result.get("return_code"),
-        "failures": failures,
-    }
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"已打包 {len(failures)} 个失败 → {out_path}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
 # gaps: 筛出需要补测的函数
 # ---------------------------------------------------------------------------
 
@@ -773,153 +610,6 @@ def cmd_record_bug(args):
     _write_json_atomic(store, bugs_path)
     print(
         f"已登记源码 bug: {args.file}::{args.function} (case {args.case_id}) → {bugs_path}",
-        file=sys.stderr,
-    )
-
-
-# ---------------------------------------------------------------------------
-# merge-state: 合并 per-file state shards → 统一 run_state
-# ---------------------------------------------------------------------------
-
-def cmd_merge_state(args):
-    baseline_path = Path(args.baseline)
-    baseline = _load_json(baseline_path)
-    if not baseline:
-        print(f"错误: 基线 {args.baseline} 为空或不存在", file=sys.stderr)
-        sys.exit(1)
-
-    merged = _init_run_state(baseline, baseline_path)
-    merged_files = merged["files"]
-
-    shards_dir = Path(args.shards_dir)
-    if not shards_dir.is_dir():
-        print(f"警告: shards dir {shards_dir} 不存在，合并出空 run_state",
-              file=sys.stderr)
-        shard_paths = []
-    else:
-        shard_paths = sorted(shards_dir.glob("*.json"))
-
-    max_round = 0
-    for shard_path in shard_paths:
-        try:
-            shard = json.loads(shard_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"警告: shard {shard_path} 无法解析: {e}", file=sys.stderr)
-            continue
-
-        max_round = max(max_round, shard.get("last_round", 0))
-
-        for src, file_data in shard.get("files", {}).items():
-            if src not in merged_files:
-                # 基线里没有的文件，追加（防止 shard 与基线不同步时丢数据）
-                merged_files[src] = {
-                    "file_md5_at_gen": file_data.get("file_md5_at_gen", ""),
-                    "test_path": file_data.get("test_path", ""),
-                    "functions": {},
-                }
-
-            if "test_path" in file_data:
-                merged_files[src]["test_path"] = file_data["test_path"]
-
-            for func_key, func_data in file_data.get("functions", {}).items():
-                cases = func_data.get("cases", [])
-                # shard 里没有 cases 的条目（skeleton）不盖真值
-                if not cases:
-                    merged_files[src]["functions"].setdefault(func_key, func_data)
-                    continue
-                merged_files[src]["functions"][func_key] = {
-                    "func_md5_at_gen": func_data.get("func_md5_at_gen", ""),
-                    "cases": cases,
-                }
-
-    # 重新汇总
-    total_cases = 0
-    passed = failed = source_bugs = 0
-    for fi in merged_files.values():
-        for f in fi.get("functions", {}).values():
-            for c in f.get("cases", []):
-                total_cases += 1
-                st = c.get("status")
-                if st == "passed":
-                    passed += 1
-                elif st in ("failed", "failed_persistent"):
-                    failed += 1
-                elif st in ("source_bug",):
-                    source_bugs += 1
-
-    merged["summary"]["total_cases"] = total_cases
-    merged["summary"]["passed"] = passed
-    merged["summary"]["failed"] = failed
-    merged["summary"]["source_bugs"] = source_bugs
-    merged["last_round"] = max_round
-    merged["generated_at"] = datetime.now().isoformat(timespec="seconds")
-
-    _write_json_atomic(merged, Path(args.output))
-    print(
-        f"已合并 {len(shard_paths)} 个 state shards → {args.output}\n"
-        f"  total_cases: {total_cases} (passed={passed}, failed={failed}, "
-        f"source_bugs={source_bugs})\n"
-        f"  last_round: {max_round}",
-        file=sys.stderr,
-    )
-
-
-# ---------------------------------------------------------------------------
-# merge-bugs: 合并 per-file bug shards → 统一 source_bugs
-# ---------------------------------------------------------------------------
-
-def cmd_merge_bugs(args):
-    shards_dir = Path(args.shards_dir)
-    merged = {
-        "version": "1.0",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "bugs": [],
-    }
-
-    by_fp = {}
-    order = []
-    shard_paths = sorted(shards_dir.glob("*.json")) if shards_dir.is_dir() else []
-
-    for shard_path in shard_paths:
-        try:
-            shard = json.loads(shard_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"警告: shard {shard_path} 无法解析: {e}", file=sys.stderr)
-            continue
-
-        for b in shard.get("bugs", []):
-            # 跳过 sub-agent 写入的 NONE 占位条目
-            if b.get("function") == "NONE" and b.get("case_id") == "NONE":
-                continue
-            fp = b.get("fingerprint") or \
-                f"{b.get('file')}::{b.get('function')}::{b.get('case_id')}"
-            if fp in by_fp:
-                existing = by_fp[fp]
-                existing["occurrence_count"] = (
-                    existing.get("occurrence_count", 1)
-                    + b.get("occurrence_count", 1)
-                )
-                lsr = b.get("last_seen_round", 0)
-                if lsr > existing.get("last_seen_round", 0):
-                    existing["last_seen_round"] = lsr
-                    existing["last_seen_at"] = b.get(
-                        "last_seen_at", existing.get("last_seen_at")
-                    )
-            else:
-                by_fp[fp] = dict(b)
-                # Phase 5: 初始化 review 字段
-                by_fp[fp].setdefault("review", {
-                    "status": "pending",
-                    "reviewer": None,
-                    "result": None,
-                })
-                order.append(fp)
-
-    merged["bugs"] = [by_fp[fp] for fp in order]
-    _write_json_atomic(merged, Path(args.output))
-    print(
-        f"已合并 {len(shard_paths)} 个 bug shards → {args.output}；共 "
-        f"{len(merged['bugs'])} 条",
         file=sys.stderr,
     )
 
@@ -1301,51 +991,6 @@ def cmd_lint_cases(args):
         sys.exit(1)
 
 
-def cmd_lint_assertions(args):
-    """扫描测试文件中的弱断言（Phase 3）。"""
-    from analyze_rules.lint_rules import lint_assertions
-
-    test_file = Path(args.test_file)
-    if not test_file.is_file():
-        print(f"错误: 测试文件 {test_file} 不存在", file=sys.stderr)
-        sys.exit(1)
-
-    test_source = test_file.read_text(encoding="utf-8", errors="replace")
-
-    # 构建 test_name → dimension 映射
-    case_dimensions = {}
-    if args.baseline:
-        baseline_path = Path(args.baseline)
-        if baseline_path.is_file():
-            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-            for fi in baseline.get("files", {}).values():
-                for func_key, func_data in fi.get("functions", {}).items():
-                    for c in func_data.get("cases", []):
-                        tn = c.get("test_name", "")
-                        dim = c.get("dimension", "")
-                        if tn and dim:
-                            case_dimensions[tn] = dim
-
-    findings = lint_assertions(test_source, case_dimensions=case_dimensions or None)
-
-    output = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "source_file": str(test_file),
-        "total_findings": len(findings),
-        "warnings": findings,
-    }
-
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    n_warn = len(findings)
-    print(
-        f"断言 lint 完成: {n_warn} 个弱断言警告 → {out_path}",
-        file=sys.stderr,
-    )
-
-
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1364,15 +1009,6 @@ def main():
     p_us.add_argument("--run-result", default=None,
                       help="可选；runner.py 产出的 run_result.json，用于自动同步 case 状态")
     p_us.add_argument("--round", type=int, required=True, help="轮数")
-
-    # extract-failures
-    p_ef = sub.add_parser("extract-failures", help="打包失败上下文")
-    p_ef.add_argument("--run-result", required=True)
-    p_ef.add_argument("--baseline", required=True, help="基线（只读）")
-    p_ef.add_argument("--run-state", required=True, help="运行状态（只读）")
-    p_ef.add_argument("--repo-root", default=".")
-    p_ef.add_argument("--output", required=True)
-    p_ef.add_argument("--pad", type=int, default=2)
 
     # gaps
     p_gaps = sub.add_parser("gaps", help="筛出需要补测的函数")
@@ -1395,21 +1031,6 @@ def main():
                        choices=["critical", "major", "minor", "unknown"])
     p_rb.add_argument("--test-file", default="")
     p_rb.add_argument("--test-name", default="")
-
-    # merge-state
-    p_ms = sub.add_parser("merge-state",
-                           help="合并 per-file state shards → 统一 run_state")
-    p_ms.add_argument("--shards-dir", required=True,
-                       help="存放 state shards 的目录（例如 .test/state_shards）")
-    p_ms.add_argument("--baseline", required=True, help="test_cases.json 路径")
-    p_ms.add_argument("--output", required=True, help="统一 run_state 输出路径")
-
-    # merge-bugs
-    p_mb = sub.add_parser("merge-bugs",
-                           help="合并 per-file bug shards → 统一 source_bugs")
-    p_mb.add_argument("--shards-dir", required=True,
-                       help="存放 bug shards 的目录（例如 .test/bug_shards）")
-    p_mb.add_argument("--output", required=True, help="统一 source_bugs 输出路径")
 
     # apply-and-run
     p_aar = sub.add_parser("apply-and-run",
@@ -1469,26 +1090,14 @@ def main():
     p_lc.add_argument("--repo-root", default=None, help="仓库根目录（用于校验 mock 路径）")
     p_lc.add_argument("--output", required=True, help="lint 结果输出路径")
 
-    # lint-assertions（Phase 3）
-    p_la = sub.add_parser("lint-assertions", help="扫描测试文件中的弱断言")
-    p_la.add_argument("--test-file", required=True, help="测试文件路径")
-    p_la.add_argument("--baseline", default=None, help="可选；test_cases.json（用于获取 dimension 映射）")
-    p_la.add_argument("--output", required=True, help="lint 结果输出路径")
-
     args = parser.parse_args()
 
     if args.command == "update-state":
         cmd_update_state(args)
-    elif args.command == "extract-failures":
-        cmd_extract_failures(args)
     elif args.command == "gaps":
         cmd_gaps(args)
     elif args.command == "record-bug":
         cmd_record_bug(args)
-    elif args.command == "merge-state":
-        cmd_merge_state(args)
-    elif args.command == "merge-bugs":
-        cmd_merge_bugs(args)
     elif args.command == "apply-and-run":
         cmd_apply_and_run(args)
     elif args.command == "classify-failures":
@@ -1499,8 +1108,6 @@ def main():
         cmd_scaffold_cases(args)
     elif args.command == "lint-cases":
         cmd_lint_cases(args)
-    elif args.command == "lint-assertions":
-        cmd_lint_assertions(args)
 
 
 if __name__ == "__main__":
