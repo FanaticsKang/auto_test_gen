@@ -411,8 +411,25 @@ def cmd_update_state(args):
 # ---------------------------------------------------------------------------
 
 def cmd_gaps(args):
+    # ---- 从 task_envelope 推导参数 ----
+    if getattr(args, "task_envelope", None) and args.task_envelope:
+        env = json.loads(Path(args.task_envelope).read_text(encoding="utf-8"))
+        if not args.run_result:
+            args.run_result = env["paths"]["run_result"]
+        if not args.run_state:
+            args.run_state = env["paths"]["state_shard"]
+
+    # ---- 从 generate_process 替代 baseline ----
+    gp_path = Path(args.generate_process) if getattr(args, "generate_process", None) else None
+    if gp_path and gp_path.is_file():
+        baseline = json.loads(gp_path.read_text(encoding="utf-8"))
+    elif args.baseline:
+        baseline = _load_json(args.baseline)
+    else:
+        print("错误: 需要 --generate-process 或 --baseline", file=sys.stderr)
+        sys.exit(1)
+
     run_result = _load_json(args.run_result)
-    baseline = _load_json(args.baseline)
     run_state = _load_json(args.run_state)
 
     if not run_result or not baseline or not run_state:
@@ -1053,9 +1070,13 @@ def main():
 
     # gaps
     p_gaps = sub.add_parser("gaps", help="筛出需要补测的函数")
-    p_gaps.add_argument("--run-result", required=True)
-    p_gaps.add_argument("--baseline", required=True, help="基线（只读）")
-    p_gaps.add_argument("--run-state", required=True, help="运行状态（只读）")
+    p_gaps.add_argument("--task-envelope", default=None,
+                        help="task_envelope JSON 路径，自动推导 --run-result/--run-state")
+    p_gaps.add_argument("--generate-process", default="test/generated_unit/generate_process.json",
+                        help="generate_process.json 路径（替代 --baseline）")
+    p_gaps.add_argument("--run-result", default=None)
+    p_gaps.add_argument("--baseline", default=None, help="基线（只读，已被 --generate-process 替代）")
+    p_gaps.add_argument("--run-state", default=None, help="运行状态（只读）")
     p_gaps.add_argument("--output", required=True)
     p_gaps.add_argument("--statement-threshold", type=int, default=None,
                         help="覆盖 baseline 中的语句覆盖率阈值")

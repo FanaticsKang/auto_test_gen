@@ -305,16 +305,13 @@ python {sd}/analyze.py decide-next \
 
 ```bash
 python {sd}/analyze.py gaps \
-  --run-result {paths.run_result} \
-  --baseline test/generated_unit/test_cases.json \
-  --run-state {paths.state_shard} \
-  --statement-threshold {coverage_config.statement_threshold} \
-  --branch-threshold {coverage_config.branch_threshold} \
-  --function-threshold {coverage_config.function_threshold} \
+  --task-envelope .test/task_envelopes/{shard_slug}.json \
   --output .test/gaps/{shard_slug}_iter{N}.json
 ```
 
-### 步骤 7b Bug 复核（Phase 5，与 escalate 同触发）
+`--task-envelope` 自动推导 `--run-result`、`--run-state`。`--generate-process` 默认读取 `test/generated_unit/generate_process.json` 替代 `--baseline`，覆盖率阈值也从该文件的 `coverage_config` 自动获取。
+
+### Bug 复核（Phase 5，与 escalate 同触发）
 
 当 `action=escalate` 且存在 `source_code_bug` verdicts 时，执行选择性复核：
 
@@ -393,7 +390,7 @@ python {sd}/dispatch.py verify-repro \
 
 ## 注意事项
 
-1. **基线只读**：`test_cases.json` 不可修改
+1. **`test_cases.json`和`generate_process.json` 只读**：不可修改，仅作为基线数据源
 2. **CASE_ID 注释**：每个测试函数上方必须有 `# CASE_ID:` 注释
 3. **不删除已有测试**：追加模式
 4. **并行隔离**：始终用 `paths.*` 中的 shard 路径，不写全局文件
