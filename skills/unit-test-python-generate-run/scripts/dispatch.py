@@ -24,7 +24,6 @@ claim 对比 batch：batch 只查不写、适合 dry-run；claim 原子写回状
 import argparse
 import json
 import re
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -339,40 +338,6 @@ def _resolve_common(process):
     max_iter = process.get("max_iterations", 5)
     shards_root = process.get("shards_root", ".test")
     return cov_config, max_iter, shards_root
-
-
-def cmd_batch(args):
-    process = _load_json(args.process)
-
-    if not process:
-        print(f"错误: 调度状态 {args.process} 不存在或为空", file=sys.stderr)
-        sys.exit(1)
-
-    cov_config, max_iter, shards_root = _resolve_common(process)
-    proc_files = process.get("files", {})
-
-    candidates = _select_candidates(proc_files, args.stale_seconds, proc_files, shards_root)
-    batch_paths = candidates[:args.number]
-
-    overall = _overall_state(proc_files)
-    if not batch_paths:
-        print(json.dumps({
-            "batch_size": 0,
-            "files": [],
-            **overall,
-        }, ensure_ascii=False))
-        return
-
-    batch = [
-        _build_file_info(p, proc_files, cov_config, max_iter, shards_root)
-        for p in batch_paths
-    ]
-
-    print(json.dumps({
-        "batch_size": len(batch),
-        "files": batch,
-        **overall,
-    }, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -1543,68 +1508,6 @@ def cmd_prepare_shard(args):
         print(f"task_envelope: {out_path}\n{info_str}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
-# verify-repro: 验证复现脚本（Phase 5）
-# ---------------------------------------------------------------------------
-
-def cmd_verify_repro(args):
-    """扫描 repro 目录下的 .py 脚本，逐个运行，输出验证结果。"""
-    repro_dir = Path(args.repro_dir)
-    if not repro_dir.is_dir():
-        print(f"错误: 复现脚本目录 {repro_dir} 不存在", file=sys.stderr)
-        sys.exit(1)
-
-    scripts = sorted(repro_dir.glob("*.py"))
-    if not scripts:
-        print(f"复现脚本目录为空: {repro_dir}", file=sys.stderr)
-
-    results = []
-    for script in scripts:
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(script)],
-                capture_output=True, text=True, timeout=30,
-            )
-            results.append({
-                "script": script.name,
-                "return_code": proc.returncode,
-                "reproducible": proc.returncode != 0,
-                "stdout": proc.stdout[:500] if proc.stdout else "",
-                "stderr": proc.stderr[:500] if proc.stderr else "",
-            })
-        except subprocess.TimeoutExpired:
-            results.append({
-                "script": script.name,
-                "return_code": -1,
-                "reproducible": False,
-                "error": "timeout (30s)",
-            })
-        except Exception as e:
-            results.append({
-                "script": script.name,
-                "return_code": -1,
-                "reproducible": False,
-                "error": str(e),
-            })
-
-    output = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "total_scripts": len(results),
-        "reproducible": sum(1 for r in results if r.get("reproducible")),
-        "results": results,
-    }
-
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(output, out_path)
-
-    n_repro = output["reproducible"]
-    print(
-        f"复现验证完成: {n_repro}/{len(results)} 可复现 → {out_path}",
-        file=sys.stderr,
-    )
-
-
-# ---------------------------------------------------------------------------
 # merge-state: 合并 per-file state shards → 统一 run_state
 # ---------------------------------------------------------------------------
 
@@ -1688,12 +1591,19 @@ def cmd_merge_state(args):
                 merged_files[src]["test_path"] = file_data["test_path"]
 
             for func_key, func_data in file_data.get("functions", {}).items():
-                cases = func_data.get("cases", [])
+                # 兼容裸列表格式：agent 可能直接写 [case, ...] 而非 {func_md5_at_gen: "", cases: [...]}
+                if isinstance(func_data, list):
+                    cases = func_data
+                else:
+                    cases = func_data.get("cases", [])
                 if not cases:
-                    merged_files[src]["functions"].setdefault(func_key, func_data)
+                    merged_files[src]["functions"].setdefault(
+                        func_key,
+                        func_data if isinstance(func_data, dict) else {"func_md5_at_gen": "", "cases": []},
+                    )
                     continue
                 merged_files[src]["functions"][func_key] = {
-                    "func_md5_at_gen": func_data.get("func_md5_at_gen", ""),
+                    "func_md5_at_gen": func_data.get("func_md5_at_gen", "") if isinstance(func_data, dict) else "",
                     "cases": cases,
                 }
 
@@ -1701,7 +1611,9 @@ def cmd_merge_state(args):
     passed = failed = source_bugs = 0
     for fi in merged_files.values():
         for f in fi.get("functions", {}).values():
-            for c in f.get("cases", []):
+            # 兼容裸列表格式（已在合并循环中标准化，此处为防御性保留）
+            f_cases = f if isinstance(f, list) else f.get("cases", [])
+            for c in f_cases:
                 total_cases += 1
                 st = c.get("status")
                 if st == "passed":
@@ -1807,14 +1719,6 @@ def main():
     p_init.add_argument("--function-threshold", type=int, default=None,
                         help="覆盖 baseline 中的函数覆盖率阈值")
 
-    # batch
-    p_batch = sub.add_parser("batch", help="只读查询 n 个待处理文件")
-    p_batch.add_argument("--process", required=True, help="generate_process.json 路径")
-    p_batch.add_argument("--number", type=int, required=True, help="选取文件数")
-    p_batch.add_argument("--stale-seconds", type=int, default=0,
-                         help=">0 时，把 claimed_at 超过该秒数仍停在"
-                              "\"执行中\"的任务视为 stale，一并纳入候选")
-
     # claim
     p_claim = sub.add_parser("claim",
                               help="原子选 N 个，标记为\"执行中\"；返回结构同 batch")
@@ -1868,14 +1772,6 @@ def main():
                        help="盲测模式：round 1 的 source_snippets 只含签名+docstring")
 
 
-    # verify-repro（Phase 5）
-    p_vr = sub.add_parser("verify-repro",
-                          help="验证复现脚本可独立运行")
-    p_vr.add_argument("--repro-dir", required=True,
-                      help="复现脚本目录（.test/repro）")
-    p_vr.add_argument("--output", required=True,
-                      help="验证结果输出路径")
-
     # merge-state
     p_ms = sub.add_parser("merge-state",
                            help="合并 per-file state shards → 统一 run_state")
@@ -1895,8 +1791,6 @@ def main():
 
     if args.command == "init":
         cmd_init(args)
-    elif args.command == "batch":
-        cmd_batch(args)
     elif args.command == "claim":
         cmd_claim(args)
     elif args.command == "report":
@@ -1905,8 +1799,6 @@ def main():
         cmd_verify_artifacts(args)
     elif args.command == "prepare-shard":
         cmd_prepare_shard(args)
-    elif args.command == "verify-repro":
-        cmd_verify_repro(args)
     elif args.command == "merge-state":
         cmd_merge_state(args)
     elif args.command == "merge-bugs":

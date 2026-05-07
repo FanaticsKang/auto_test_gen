@@ -91,6 +91,7 @@ python {sd}/runner.py run \
   --test-file {test_path} \
   --scope-sources {source_path} \
   --output {paths.run_result} \
+  --baseline test/generated_unit/generate_process.json \
   --repo-root .
 ```
 
@@ -187,6 +188,18 @@ python {sd}/runner.py run \
 ```
 
 无 bug 时写 `{"bugs": []}`。**这个文件必须存在**，否则主 agent 产物校验失败。
+
+### 格式验证
+
+写完 state_shard 和 bug_shard 后，运行格式验证脚本：
+
+```bash
+python {sd}/validate_shard.py \
+  --state-shard {paths.state_shard} \
+  --bug-shard {paths.bug_shard}
+```
+
+验证不通过（非零 exit code）时，按错误提示修正 shard 文件格式后重跑验证。
 
 ---
 
