@@ -178,12 +178,13 @@ python .claude/skills/unit-test-python-generate-run/scripts/dispatch.py claim --
 说明：
 1. 默认读取 `test/generated_unit/generate_process.json`。可通过 `--process` 配置。
 2. `--number` 使用步骤 3 确认的并发数。
-3. 输出同时落盘到 `.test/claim_batch/<timestamp>.json`，保留所有批次历史。
+3. 输出同时落盘到 `.test/claim_batch/` 目录，保留所有批次历史。
 
 这一步同时完成选中 N 个文件并将其标注为 `"running"`，无需再用 Edit 改 JSON。返回的 JSON：
 
 - `batch_size`：本轮实际 claim 的文件数
 - `claimed_at`：本轮 claim 的 ISO 时间戳
+- `claim_batch_path`：claim batch 文件的实际路径（**步骤 5a 的 `--from-claim` 必须使用此字段，不要用 `claimed_at` 拼接**）
 - `files[]`：与 batch 同构，每个文件带 `paths.{run_result,state_shard,bug_shard,slug}`
   —— 这些 shard 路径**必须**原样传给子 agent，否则并行时会互相覆盖
 - `status_counts`：各状态计数
@@ -219,7 +220,7 @@ python .claude/skills/unit-test-python-generate-run/scripts/dispatch.py claim --
 
 ```bash
 python .claude/skills/unit-test-python-generate-run/scripts/dispatch.py prepare-shard \
-  --from-claim .test/claim_batch/<步骤4输出的时间戳>.json \
+  --from-claim <步骤4返回的claim_batch_path> \
   --blind
 ```
 

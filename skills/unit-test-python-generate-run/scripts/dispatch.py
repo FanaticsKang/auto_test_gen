@@ -500,7 +500,9 @@ def cmd_claim(args):
     claim_dir = Path(args.claim_dir)
     claim_dir.mkdir(parents=True, exist_ok=True)
     ts_filename = now_iso.replace(":", "-") + ".json"
-    _write_json_atomic(result, claim_dir / ts_filename)
+    claim_batch_path = str(claim_dir / ts_filename)
+    result["claim_batch_path"] = claim_batch_path
+    _write_json_atomic(result, Path(claim_batch_path))
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
