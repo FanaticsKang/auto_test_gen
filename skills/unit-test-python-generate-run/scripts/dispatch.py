@@ -1343,14 +1343,6 @@ def _build_single_envelope(process, src_path, round_num, repo_root=".", blind=Fa
                     for c in cases
                 ]
 
-    run_result_path = Path(paths["run_result"])
-    coverage = {}
-    coverage_summary = {}
-    if run_result_path.is_file():
-        rr = json.loads(run_result_path.read_text(encoding="utf-8"))
-        coverage = rr.get("coverage", {}).get(src_path, {})
-        coverage_summary = rr.get("summary", {}).get("coverage", {})
-
     verdicts = []
     verdicts_path = Path(f"{shards_root.rstrip('/')}/verdicts/{slug}.json")
     if verdicts_path.is_file():
@@ -1428,8 +1420,6 @@ def _build_single_envelope(process, src_path, round_num, repo_root=".", blind=Fa
         "scope_sources": [src_path],
         "functions": functions,
         "existing_cases": existing_cases,
-        "coverage": coverage,
-        "coverage_summary": coverage_summary,
         "coverage_config": cov_config,
         "source_snippets": source_snippets,
         "oracle_quality": oracle_quality_map if oracle_quality_map else None,

@@ -6,7 +6,7 @@ model: sonnet
 
 # Python 单测生成 Sub-agent
 
-你负责为**一个源文件**生成单元测试，迭代直到覆盖率达标或迭代耗尽。
+你负责为**一个源文件**生成单元测试，迭代直到覆盖率达标或迭代耗尽。你的职责首先是**发现代码中的bug**，其次是尽可能高的完成覆盖率要求。
 
 脚本路径：`.claude/skills/unit-test-python-generate-run/scripts`，下文简称 `{sd}`。
 
@@ -24,7 +24,6 @@ model: sonnet
 - `paths`：shard 文件路径（`run_result`、`state_shard`、`bug_shard`、`heartbeat`）
 - `budgets`：`max_iterations`、`max_fix_attempts_per_case`
 - `existing_cases`：已有的 case 列表（迭代 N>1 时非空）
-- `coverage`：当前覆盖率（迭代 N>1 时非空）
 
 **`source_snippets` 已包含源码，不需要再 Read 源文件**（Round 3+ sighted 模式除外）。
 
@@ -95,7 +94,7 @@ python {sd}/runner.py run \
   --repo-root .
 ```
 
-这是 sub-agent 唯一需要调用的脚本。它执行 pytest + 采集覆盖率，结果写入 `paths.run_result`。
+它执行 pytest + 采集覆盖率，结果写入 `paths.run_result`。
 
 输出 JSON 关键字段：
 - `return_code`：0=全过，1=有失败，2+=工具/环境错误
